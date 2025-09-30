@@ -1,5 +1,5 @@
 {
-    "word_embedding_dimension": 384,
+    "word_embedding_dimension": 128,
     "pooling_mode_cls_token": false,
     "pooling_mode_mean_tokens": true,
     "pooling_mode_max_tokens": false,

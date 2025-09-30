@@ -7,7 +7,7 @@ import json
 import pickle
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Sequence
+from typing import Dict, List, Any, Optional, Sequence, Set
 import time
 import logging
 import torch
@@ -173,6 +173,101 @@ class LocalHealthRAG:
         # Fall back to the first candidate even if it does not exist yet
         return candidates[0] if candidates else self._repo_root
 
+    def _discover_llm_candidates(self) -> List[Path]:
+        """Return possible on-disk locations that may host a TinyLlama checkpoint."""
+        preferred_subdirs = [
+            Path("quantized_tinyllama_health"),
+            Path("TinyLlama-1.1B-Chat-v1.0"),
+        ]
+
+        search_roots = [
+            self.models_dir,
+            self._repo_root / "agent" / "mobile_models",
+            self._repo_root / "mobile_models",
+            self._module_dir / ".." / "mobile_models",
+            Path.cwd() / "agent" / "mobile_models",
+            Path.cwd() / "mobile_models",
+        ]
+
+        candidates: List[Path] = []
+        seen: Set[Path] = set()
+
+        for root in search_roots:
+            root = root.resolve(strict=False)
+            if not root.exists():
+                continue
+            for subdir in preferred_subdirs:
+                candidate = (root / subdir).resolve(strict=False)
+                if candidate.exists() and candidate not in seen:
+                    if self._looks_like_llm_dir(candidate):
+                        candidates.append(candidate)
+                        seen.add(candidate)
+
+        # Also include the models_dir itself if it contains a checkpoint directly
+        if self._looks_like_llm_dir(self.models_dir) and self.models_dir not in seen:
+            candidates.append(self.models_dir)
+
+        return candidates
+
+    def _discover_embedding_candidates(self) -> List[Path]:
+        """Return possible on-disk locations that may host a MiniLM checkpoint."""
+        preferred_subdirs = [
+            Path("quantized_minilm_health"),
+            Path("all-MiniLM-L6-v2"),
+        ]
+
+        search_roots = [
+            self.models_dir,
+            self._repo_root / "agent" / "mobile_models",
+            self._repo_root / "mobile_models",
+            self._module_dir / ".." / "mobile_models",
+            Path.cwd() / "agent" / "mobile_models",
+            Path.cwd() / "mobile_models",
+        ]
+
+        candidates: List[Path] = []
+        seen: Set[Path] = set()
+
+        for root in search_roots:
+            root = root.resolve(strict=False)
+            if not root.exists():
+                continue
+            for subdir in preferred_subdirs:
+                candidate = (root / subdir).resolve(strict=False)
+                if candidate.exists() and candidate not in seen:
+                    if self._looks_like_sentence_transformer_dir(candidate):
+                        candidates.append(candidate)
+                        seen.add(candidate)
+
+        if self._looks_like_sentence_transformer_dir(self.models_dir) and self.models_dir not in seen:
+            candidates.append(self.models_dir)
+
+        return candidates
+
+    @staticmethod
+    def _looks_like_llm_dir(path: Path) -> bool:
+        """Heuristic to confirm a directory contains a loadable LLM checkpoint."""
+        if not path.is_dir():
+            return False
+        config_exists = (path / "config.json").exists()
+        safetensor_exists = any(path.glob("*.safetensors"))
+        tokenizer_exists = any((path / name).exists() for name in [
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+        ])
+        return config_exists and safetensor_exists and tokenizer_exists
+
+    @staticmethod
+    def _looks_like_sentence_transformer_dir(path: Path) -> bool:
+        """Heuristic to confirm a directory hosts a sentence-transformers package."""
+        if not path.is_dir():
+            return False
+        config_exists = (path / "config.json").exists() or (path / "config_sentence_transformers.json").exists()
+        safetensor_exists = any(path.glob("*.safetensors"))
+        modules_file = (path / "modules.json").exists()
+        return config_exists and safetensor_exists and modules_file
+
     def _load_health_data(self):
         """Load health guidelines and emergency protocols"""
         try:
@@ -201,9 +296,24 @@ class LocalHealthRAG:
         """Load sentence transformer model for embeddings"""
         try:
             logger.info("🔄 Loading embedding model...")
+
+            errors: List[str] = []
+            for candidate in self._discover_embedding_candidates():
+                try:
+                    self.embedding_model = SentenceTransformer(str(candidate))
+                    logger.info(f"✅ Embedding model loaded from {candidate}")
+                    return
+                except Exception as candidate_error:  # pragma: no cover - logging only
+                    errors.append(f"{candidate}: {candidate_error}")
+
+            # Fall back to the configured name (may be a Hugging Face identifier or absolute path)
             self.embedding_model = SentenceTransformer(self.embedding_model_name)
-            logger.info("✅ Embedding model loaded successfully")
+            logger.info(f"✅ Embedding model loaded using identifier '{self.embedding_model_name}'")
+
         except Exception as e:
+            if errors:
+                for err in errors:
+                    logger.warning(f"⚠️ Candidate embedding load failed: {err}")
             logger.error(f"❌ Error loading embedding model: {e}")
             self.embedding_model = None
     
@@ -211,48 +321,47 @@ class LocalHealthRAG:
         """Load TinyLlama model for local inference (macOS compatible)"""
         try:
             # Find model path
-            possible_paths = [
-                self.models_dir / "quantized_tinyllama_health",
-                Path("../mobile_models/quantized_tinyllama_health"),
-                Path("../../agent/mobile_models/quantized_tinyllama_health"),
-                Path("mobile_models/quantized_tinyllama_health")
-            ]
-            
             model_path = None
-            for path in possible_paths:
-                if path.exists():
-                    model_path = path
+            errors: List[str] = []
+
+            for candidate in self._discover_llm_candidates():
+                try:
+                    logger.info(f"🔍 Trying TinyLlama candidate: {candidate}")
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        str(candidate),
+                        trust_remote_code=True
+                    )
+                    model = AutoModelForCausalLM.from_pretrained(
+                        str(candidate),
+                        trust_remote_code=True,
+                        dtype=torch.float32,
+                        low_cpu_mem_usage=True,
+                        use_safetensors=True,
+                        load_in_8bit=False,
+                        load_in_4bit=False
+                    )
+                    model_path = candidate
+                    self.llm_tokenizer = tokenizer
+                    self.llm_model = model
                     break
-            
+                except Exception as candidate_error:  # pragma: no cover - logging only
+                    errors.append(f"{candidate}: {candidate_error}")
+
             if model_path is None:
                 logger.warning("⚠️ TinyLlama model not found, using fallback responses")
+                if errors:
+                    for err in errors:
+                        logger.warning(f"⚠️ Candidate TinyLlama load failed: {err}")
                 return
-            
-            logger.info("🔄 Loading TinyLlama model (macOS compatible)...")
-            
-            # Load tokenizer
-            self.llm_tokenizer = AutoTokenizer.from_pretrained(
-                str(model_path),
-                trust_remote_code=True
-            )
-            
-            # Load model without quantization for macOS compatibility
-            self.llm_model = AutoModelForCausalLM.from_pretrained(
-                str(model_path),
-                trust_remote_code=True,
-                dtype=torch.float32,
-                device_map="cpu",
-                low_cpu_mem_usage=True,
-                use_safetensors=True,
-                load_in_8bit=False,
-                load_in_4bit=False
-            )
-            
+
             # Set pad token
             if self.llm_tokenizer.pad_token is None:
                 self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
-            
-            logger.info("✅ TinyLlama model loaded successfully (CPU mode)")
+
+            if self.llm_model is not None:
+                self.llm_model.to(torch.device("cpu"))
+
+            logger.info(f"✅ TinyLlama model loaded successfully from {model_path} (CPU mode)")
             
         except Exception as e:
             logger.warning(f"⚠️ TinyLlama model loading failed: {e}")
