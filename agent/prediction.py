@@ -235,6 +235,7 @@ def _store_in_vector_db(session_id: str, envelope: ChatEnvelope) -> Optional[str
 
     # Persist metadata so LocalHealthRAG can surface it in results
     rag_system.doc_ids.append(doc_id)  # type: ignore[attr-defined]
+    
     if hasattr(rag_system, "vector_index_size"):
         rag_system.vector_index_size = len(rag_system.doc_ids)  # type: ignore[attr-defined]
     rag_system.guidelines[doc_id] = {
@@ -329,6 +330,7 @@ async def chat(req: ChatReq):
                 "prompt_version": "v2-rich",
             },
             "rag_status": rag_system.get_system_status(),
+
             # Raw fields that UIs can present directly:
             "emergency_type": result.get("emergency_type"),
             "call_911": bool(result.get("call_911")),
