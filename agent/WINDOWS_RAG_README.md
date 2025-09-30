@@ -28,7 +28,11 @@ A complete RAG (Retrieval-Augmented Generation) system optimized for Windows, fe
 git clone <your-repo>
 cd HealthHub/agent
 
-# 2. Run the Windows setup script
+# 2. Pull model weights (recommended via Git LFS)
+git lfs install
+git lfs pull
+
+# 3. Run the Windows setup script
 python setup_windows.py
 ```
 
@@ -38,7 +42,14 @@ python setup_windows.py
 # 1. Install requirements
 pip install -r requirements_windows.txt
 
-# 2. Test the system
+# 2. Ensure local model assets exist
+#    Option A: Pull real checkpoints with Git LFS (preferred on fast networks)
+git lfs pull
+
+#    Option B: Generate lightweight offline stubs for smoke-testing
+python -m src.prepare_local_models --force
+
+# 3. Test the system
 python windows_rag_system.py
 ```
 
