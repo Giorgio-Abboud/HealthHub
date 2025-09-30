@@ -26,6 +26,8 @@ log = logging.getLogger(__name__)
 
 log = logging.getLogger(__name__)
 
+log = logging.getLogger(__name__)
+
 rag_system = LocalHealthRAG()
 status = rag_system.get_system_status()
 
@@ -40,16 +42,32 @@ def _summarize_candidate_path(path: Path) -> Dict[str, Any]:
     try:
         config_path = path / "config.json"
         tokenizer_path = path / "tokenizer.json"
-        safetensors = sorted(p.name for p in path.glob("*.safetensors"))
-        if not safetensors:
-            safetensors = sorted(p.name for p in path.rglob("*.safetensors"))[:3]
+        safetensor_paths = list(path.glob("*.safetensors"))
+        if not safetensor_paths:
+            safetensor_paths = list(path.rglob("*.safetensors"))[:3]
+
+        safetensor_details: List[Dict[str, Any]] = []
+        total_size = 0
+        for st_path in safetensor_paths:
+            try:
+                size = st_path.stat().st_size
+            except OSError:
+                size = None
+            else:
+                total_size += size or 0
+            safetensor_details.append({
+                "name": st_path.name,
+                "size_bytes": size,
+            })
 
         info.update({
             "config_present": config_path.exists(),
             "config_size_bytes": config_path.stat().st_size if config_path.exists() else None,
             "tokenizer_present": tokenizer_path.exists(),
             "tokenizer_size_bytes": tokenizer_path.stat().st_size if tokenizer_path.exists() else None,
-            "safetensor_files": safetensors,
+
+            "safetensor_files": safetensor_details,
+            "safetensor_total_bytes": total_size,
         })
 
         if config_path.exists():
@@ -65,7 +83,6 @@ def _summarize_candidate_path(path: Path) -> Dict[str, Any]:
 
 if not status.get("system_ready", False):
     raise RuntimeError("LocalHealthRAG system is not ready. Check your setup.")
-
 
 if not status.get("llm_model_loaded", False):
     llm_error = status.get("llm_error")
@@ -86,6 +103,10 @@ if not status.get("llm_model_loaded", False):
         "llm_model_path": status.get("llm_model_path"),
         "models_dir": str(models_dir) if models_dir is not None else None,
         "candidate_paths": candidate_details,
+
+        "llm_candidate_errors": status.get("llm_candidate_errors", []),
+        "llm_weight_bytes": status.get("llm_weight_bytes"),
+
     }
 
     LLM_STARTUP_ERROR = (

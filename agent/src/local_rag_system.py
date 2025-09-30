@@ -143,6 +143,10 @@ class LocalHealthRAG:
         self.llm_model_path: Optional[str] = None
         self.llm_error: Optional[str] = None
 
+        self.llm_candidate_errors: List[str] = []
+        self.llm_weight_bytes: Optional[int] = None
+
+
         self.embedding_model = None
         self.embedding_model_path: Optional[str] = None
         self.embedding_error: Optional[str] = None
@@ -361,6 +365,31 @@ class LocalHealthRAG:
             self.embedding_model = None
             self.embedding_error = str(e)
 
+    def _collect_safetensor_stats(self, candidate: Path) -> Dict[str, Any]:
+        """Return safetensor metadata (path + size) for diagnostics."""
+        safetensor_files = list(candidate.glob("*.safetensors"))
+        if not safetensor_files:
+            safetensor_files = list(candidate.rglob("*.safetensors"))
+
+        details = []
+        total_size = 0
+        for st_path in safetensor_files:
+            try:
+                size = st_path.stat().st_size
+            except OSError:
+                size = 0
+            total_size += size
+            details.append({
+                "path": str(st_path),
+                "size_bytes": size,
+            })
+
+        return {
+            "files": details,
+            "total_size_bytes": total_size,
+        }
+
+
     def _load_tinyllama_model(self):
         """Load TinyLlama model for local inference (macOS compatible)"""
         try:
@@ -370,10 +399,30 @@ class LocalHealthRAG:
 
             self.llm_error = None
             self.llm_model_path = None
+            self.llm_candidate_errors = []
+            self.llm_weight_bytes = None
+
 
             for candidate in self._discover_llm_candidates():
                 try:
                     logger.info(f"🔍 Trying TinyLlama candidate: {candidate}")
+                    st_stats = self._collect_safetensor_stats(candidate)
+                    total_bytes = st_stats.get("total_size_bytes", 0)
+                    if total_bytes and total_bytes < 50 * 1024 * 1024:  # 50 MB threshold
+                        truncated_msg = (
+                            f"weights appear truncated ({total_bytes} bytes). "
+                            "Download the full TinyLlama checkpoint (~2 GB)."
+                        )
+                        logger.warning(
+                            "⚠️ TinyLlama candidate rejected due to insufficient weight size: %s (%s)",
+                            candidate,
+                            truncated_msg,
+                        )
+                        errors.append(f"{candidate}: {truncated_msg}")
+                        if not self.llm_error:
+                            self.llm_error = truncated_msg
+                        continue
+
                     tokenizer = AutoTokenizer.from_pretrained(
                         str(candidate),
                         trust_remote_code=True
@@ -391,6 +440,8 @@ class LocalHealthRAG:
                     self.llm_tokenizer = tokenizer
                     self.llm_model = model
                     self.llm_model_path = str(candidate)
+                    self.llm_weight_bytes = total_bytes or None
+
                     break
                 except Exception as candidate_error:  # pragma: no cover - logging only
                     errors.append(f"{candidate}: {candidate_error}")
@@ -400,7 +451,9 @@ class LocalHealthRAG:
                 if errors:
                     for err in errors:
                         logger.debug(f"TinyLlama candidate skipped: {err}")
-                self.llm_error = "TinyLlama checkpoint not found on disk"
+                if not self.llm_error:
+                    self.llm_error = "TinyLlama checkpoint not found on disk"
+                self.llm_candidate_errors = errors
 
                 return
 
@@ -412,12 +465,17 @@ class LocalHealthRAG:
                 self.llm_model.to(torch.device("cpu"))
 
             logger.info(f"✅ TinyLlama model loaded successfully from {model_path} (CPU mode)")
-            
+            if errors:
+                self.llm_candidate_errors = errors
+
         except Exception as e:
             logger.info("ℹ️ TinyLlama model loading failed; using rule-based responses instead: %s", e)
             self.llm_model = None
             self.llm_tokenizer = None
             self.llm_error = str(e)
+            if errors:
+                self.llm_candidate_errors = errors
+
 
     def _build_vector_index(self):
         """Build FAISS vector index from health guidelines"""
@@ -795,6 +853,8 @@ Response:"""
             "llm_model_loaded": self.llm_model is not None,
             "llm_model_path": self.llm_model_path,
             "llm_error": self.llm_error,
+            "llm_candidate_errors": self.llm_candidate_errors,
+            "llm_weight_bytes": self.llm_weight_bytes,
             "embedding_model_loaded": self.embedding_model is not None,
             "embedding_model_path": self.embedding_model_path,
             "embedding_error": self.embedding_error,
