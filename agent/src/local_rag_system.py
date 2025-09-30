@@ -142,8 +142,10 @@ class LocalHealthRAG:
         self.llm_tokenizer = None
         self.llm_model_path: Optional[str] = None
         self.llm_error: Optional[str] = None
+
         self.llm_candidate_errors: List[str] = []
         self.llm_weight_bytes: Optional[int] = None
+
 
         self.embedding_model = None
         self.embedding_model_path: Optional[str] = None
@@ -387,6 +389,7 @@ class LocalHealthRAG:
             "total_size_bytes": total_size,
         }
 
+
     def _load_tinyllama_model(self):
         """Load TinyLlama model for local inference (macOS compatible)"""
         try:
@@ -398,6 +401,7 @@ class LocalHealthRAG:
             self.llm_model_path = None
             self.llm_candidate_errors = []
             self.llm_weight_bytes = None
+
 
             for candidate in self._discover_llm_candidates():
                 try:
@@ -437,6 +441,7 @@ class LocalHealthRAG:
                     self.llm_model = model
                     self.llm_model_path = str(candidate)
                     self.llm_weight_bytes = total_bytes or None
+
                     break
                 except Exception as candidate_error:  # pragma: no cover - logging only
                     errors.append(f"{candidate}: {candidate_error}")
@@ -449,6 +454,7 @@ class LocalHealthRAG:
                 if not self.llm_error:
                     self.llm_error = "TinyLlama checkpoint not found on disk"
                 self.llm_candidate_errors = errors
+
                 return
 
             # Set pad token
@@ -469,6 +475,7 @@ class LocalHealthRAG:
             self.llm_error = str(e)
             if errors:
                 self.llm_candidate_errors = errors
+
 
     def _build_vector_index(self):
         """Build FAISS vector index from health guidelines"""

@@ -20,7 +20,11 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 # ─────────────────────────────────────────
 # In-process RAG pipeline (your code)
 # ─────────────────────────────────────────
-from src.local_rag_system import LocalHealthRAG
+from .src.local_rag_system import LocalHealthRAG
+
+log = logging.getLogger(__name__)
+
+log = logging.getLogger(__name__)
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +65,7 @@ def _summarize_candidate_path(path: Path) -> Dict[str, Any]:
             "config_size_bytes": config_path.stat().st_size if config_path.exists() else None,
             "tokenizer_present": tokenizer_path.exists(),
             "tokenizer_size_bytes": tokenizer_path.stat().st_size if tokenizer_path.exists() else None,
+
             "safetensor_files": safetensor_details,
             "safetensor_total_bytes": total_size,
         })
@@ -98,8 +103,10 @@ if not status.get("llm_model_loaded", False):
         "llm_model_path": status.get("llm_model_path"),
         "models_dir": str(models_dir) if models_dir is not None else None,
         "candidate_paths": candidate_details,
+
         "llm_candidate_errors": status.get("llm_candidate_errors", []),
         "llm_weight_bytes": status.get("llm_weight_bytes"),
+
     }
 
     LLM_STARTUP_ERROR = (
@@ -109,6 +116,7 @@ if not status.get("llm_model_loaded", False):
     )
 
     log.error("TinyLlama failed to load: %s", json.dumps(LLM_DIAGNOSTICS, indent=2))
+
 
 log.info("LocalHealthRAG component status: %s", json.dumps(status, indent=2))
 
@@ -357,6 +365,7 @@ async def health() -> Dict[str, Any]:
         payload["llm_error"] = LLM_STARTUP_ERROR
         payload["llm_diagnostics"] = LLM_DIAGNOSTICS
     return payload
+
 
 @app.post("/chat")
 async def chat(req: ChatReq):
