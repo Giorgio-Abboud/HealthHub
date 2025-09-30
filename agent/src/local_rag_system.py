@@ -4,17 +4,17 @@ Includes TinyLlama model, text embeddings, vector database, health guidelines, a
 """
 
 import json
-import pickle
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Sequence, Tuple
 import time
 import logging
+import os
+import re
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from sentence_transformers import SentenceTransformer
 import faiss
-import os
 import requests
 
 logger = logging.getLogger(__name__)
@@ -86,9 +86,9 @@ class RAGAnythingClient:
 
 class LocalHealthRAG:
     """Complete local RAG system with TinyLlama, embeddings, and vector search"""
-    
-    def __init__(self, 
-                 models_dir: str = "../mobile_models", 
+
+    def __init__(self,
+                 models_dir: str = "../mobile_models",
                  data_dir: str = "../../mobile_rag_ready",
                  embedding_model_name: str = "all-MiniLM-L6-v2",
                  rag_anything_url: str = "http://localhost:9999"):
@@ -101,21 +101,56 @@ class LocalHealthRAG:
             embedding_model_name: Sentence transformer model for embeddings
             rag_anything_url: URL of RAG-Anything server
         """
-        self.models_dir = Path(models_dir)
-        self.data_dir = Path(data_dir)
+        self._module_dir = Path(__file__).resolve().parent
+        self._repo_root = self._module_dir.parents[1]
+
+        self.models_dir = self._resolve_directory(models_dir, [
+            Path("agent") / "mobile_models",
+            Path("mobile_models"),
+        ])
+        self.data_dir = self._resolve_directory(data_dir, [
+            Path("mobile_rag_ready"),
+            Path("agent") / "mobile_rag_ready",
+        ])
         self.embedding_model_name = embedding_model_name
-        
+        self.default_llm_hub_id = os.getenv("LOCAL_LLM_ID", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        self.default_embedding_hub_id = os.getenv("LOCAL_EMBEDDING_ID", embedding_model_name)
+
         # Initialize components
         self.llm_model = None
         self.llm_tokenizer = None
+        self.llm_model_path: Optional[str] = None
         self.embedding_model = None
+        self.embedding_model_path: Optional[str] = None
+        self.embedding_diagnostic: Optional[str] = None
         self.vector_index = None
-        self.guidelines = {}
-        self.emergency_protocols = {}
+        self.vector_index_size: int = 0
+        self.guidelines: Dict[str, Dict[str, Any]] = {}
+        self.emergency_protocols: Dict[str, Dict[str, Any]] = {}
+        self.doc_ids: List[str] = []
+        self.llm_diagnostic: Optional[str] = None
+        self.red_flag_patterns: List[re.Pattern[str]] = [
+            re.compile(p, re.IGNORECASE)
+            for p in [
+                r"not\s+breathing", r"blue\s+lips",
+                r"(?:one|left|right)[-\s]?sided\s+weakness",
+                r"face\s+droop|drooping\s+face|half\s+droop",
+                r"speech\s+difficulty|slurred\s+speech",
+                r"severe\s+chest\s+pain",
+                r"radiating\s+(?:left\s+)?arm",
+                r"faint(?:ing)?|blacking\s+out|passed\s+out",
+                r"anaphylaxis",
+                r"unconscious|cannot\s+wake",
+                r"seizure\s*(?:lasting|>\s*5)|grand\s+mal",
+            ]
+        ]
         
+        logger.info(f"📁 Models directory resolved to: {self.models_dir}")
+        logger.info(f"📂 Data directory resolved to: {self.data_dir}")
+
         # Initialize RAG-Anything client
         self.rag_anything_client = RAGAnythingClient(rag_anything_url)
-        
+
         # Load all components
         self._load_health_data()
         self._load_embedding_model()
@@ -129,7 +164,105 @@ class LocalHealthRAG:
         logger.info(f"🔍 Embedding Model: {'Loaded' if self.embedding_model is not None else 'Not Available'}")
         logger.info(f"📊 Vector Index: {'Built' if self.vector_index is not None else 'Not Available'}")
         logger.info(f"🌐 RAG-Anything Server: {'Connected' if self.rag_anything_client.is_available() else 'Not Available'}")
-    
+
+    def _resolve_directory(self, configured_path: str, fallback_subdirs: Sequence[Path]) -> Path:
+        """Resolve a directory by checking several repo-relative fallbacks."""
+        candidates: List[Path] = []
+
+        raw_path = Path(configured_path).expanduser()
+        if raw_path.is_absolute():
+            candidates.append(raw_path)
+        else:
+            candidates.extend([
+                (self._module_dir / raw_path).resolve(strict=False),
+                (self._repo_root / raw_path).resolve(strict=False),
+                (Path.cwd() / raw_path).resolve(strict=False),
+                raw_path.resolve(strict=False),
+            ])
+
+        for subdir in fallback_subdirs:
+            sub_candidate = (self._repo_root / subdir).resolve(strict=False)
+            if sub_candidate not in candidates:
+                candidates.append(sub_candidate)
+            alt = (self._module_dir / subdir).resolve(strict=False)
+            if alt not in candidates:
+                candidates.append(alt)
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        # Fall back to the first candidate even if it does not exist yet
+        return candidates[0] if candidates else self._repo_root
+
+    def _looks_like_llm_dir(self, path: Path) -> bool:
+        """Heuristic to determine if a directory holds a causal language model."""
+        if not path.exists() or not path.is_dir():
+            return False
+
+        config_file = path / "config.json"
+        weight_files = [
+            path / "pytorch_model.bin",
+            path / "model.safetensors",
+        ]
+
+        if not config_file.exists():
+            return False
+
+        return any(w.exists() for w in weight_files)
+
+    def _discover_llm_candidates(self) -> List[Path]:
+        """Return likely directories that contain a TinyLlama-compatible model."""
+        env_override = os.getenv("LOCAL_LLM_PATH")
+        candidates: List[Path] = []
+
+        if env_override:
+            candidates.append(Path(env_override).expanduser())
+
+        static_candidates = [
+            self.models_dir / "quantized_tinyllama_health",
+            self.models_dir / "tinyllama",
+            self.models_dir / "TinyLlama",
+            self.models_dir / "TinyLlama-1.1B-Chat-v1.0",
+            self.models_dir / "tinyllama-1.1b-chat-v1.0",
+            self.models_dir / "qwen2_5_0_5b",
+            Path("agent") / "mobile_models" / "quantized_tinyllama_health",
+            Path("agent") / "mobile_models" / "TinyLlama",
+            Path("agent") / "mobile_models" / "TinyLlama-1.1B-Chat-v1.0",
+            Path("mobile_models") / "quantized_tinyllama_health",
+        ]
+
+        for candidate in static_candidates:
+            resolved = candidate.resolve(strict=False)
+            if resolved not in candidates:
+                candidates.append(resolved)
+
+        # Only return directories that look like actual LLM repos
+        return [c for c in candidates if self._looks_like_llm_dir(c)]
+
+    def _discover_embedding_candidates(self) -> List[Path]:
+        """Return likely directories that contain a sentence-transformer embedding model."""
+        env_override = os.getenv("LOCAL_EMBEDDING_PATH")
+        candidates: List[Path] = []
+
+        if env_override:
+            candidates.append(Path(env_override).expanduser())
+
+        static_candidates = [
+            self.models_dir / "quantized_minilm_health",
+            self.models_dir / self.embedding_model_name,
+            Path("agent") / "mobile_models" / "quantized_minilm_health",
+            Path("agent") / "mobile_models" / self.embedding_model_name,
+            Path("mobile_models") / "quantized_minilm_health",
+        ]
+
+        for candidate in static_candidates:
+            resolved = candidate.resolve(strict=False)
+            if resolved not in candidates and resolved.exists():
+                candidates.append(resolved)
+
+        return candidates
+
     def _load_health_data(self):
         """Load health guidelines and emergency protocols"""
         try:
@@ -157,47 +290,55 @@ class LocalHealthRAG:
     def _load_embedding_model(self):
         """Load sentence transformer model for embeddings"""
         try:
-            logger.info("🔄 Loading embedding model...")
-            self.embedding_model = SentenceTransformer(self.embedding_model_name)
+            candidates = self._discover_embedding_candidates()
+            if candidates:
+                chosen = str(candidates[0])
+                logger.info(f"🔄 Loading embedding model from {chosen}...")
+                self.embedding_model = SentenceTransformer(chosen)
+                self.embedding_model_path = chosen
+                self.embedding_diagnostic = f"loaded from {chosen}"
+            else:
+                fallback_id = self.default_embedding_hub_id
+                logger.info(f"🔄 Loading embedding model by hub id: {fallback_id}")
+                self.embedding_model = SentenceTransformer(fallback_id)
+                self.embedding_model_path = fallback_id
+                self.embedding_diagnostic = f"loaded via hub id {fallback_id}"
+
             logger.info("✅ Embedding model loaded successfully")
         except Exception as e:
             logger.error(f"❌ Error loading embedding model: {e}")
             self.embedding_model = None
-    
+            self.embedding_model_path = None
+            self.embedding_diagnostic = str(e)
+
     def _load_tinyllama_model(self):
         """Load TinyLlama model for local inference (macOS compatible)"""
         try:
-            # Find model path
-            possible_paths = [
-                self.models_dir / "quantized_tinyllama_health",
-                Path("../mobile_models/quantized_tinyllama_health"),
-                Path("../../agent/mobile_models/quantized_tinyllama_health"),
-                Path("mobile_models/quantized_tinyllama_health")
-            ]
-            
-            model_path = None
-            for path in possible_paths:
-                if path.exists():
-                    model_path = path
-                    break
-            
-            if model_path is None:
-                logger.warning("⚠️ TinyLlama model not found, using fallback responses")
-                return
-            
-            logger.info("🔄 Loading TinyLlama model (macOS compatible)...")
-            
+            candidates = self._discover_llm_candidates()
+            if candidates:
+                model_location = str(candidates[0])
+                logger.info(f"🔄 Loading TinyLlama-compatible model from {model_location}...")
+            else:
+                model_location = self.default_llm_hub_id
+                logger.info(
+                    "🔄 No local TinyLlama weights detected; attempting download from hub id %s",
+                    model_location,
+                )
+
+            self.llm_model_path = model_location
+            self.llm_diagnostic = f"loading from {model_location}"
+
             # Load tokenizer
             self.llm_tokenizer = AutoTokenizer.from_pretrained(
-                str(model_path),
+                model_location,
                 trust_remote_code=True
             )
-            
-            # Load model without quantization for macOS compatibility
+
+            # Load model without quantization for macOS/CPU compatibility
             self.llm_model = AutoModelForCausalLM.from_pretrained(
-                str(model_path),
+                model_location,
                 trust_remote_code=True,
-                dtype=torch.float32,
+                torch_dtype=torch.float32,
                 device_map="cpu",
                 low_cpu_mem_usage=True,
                 use_safetensors=True,
@@ -208,15 +349,60 @@ class LocalHealthRAG:
             # Set pad token
             if self.llm_tokenizer.pad_token is None:
                 self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
-            
+
             logger.info("✅ TinyLlama model loaded successfully (CPU mode)")
-            
+            self.llm_diagnostic = f"loaded from {model_location}"
+
         except Exception as e:
             logger.warning(f"⚠️ TinyLlama model loading failed: {e}")
             logger.info("💡 Using rule-based responses instead of AI-generated text")
             self.llm_model = None
             self.llm_tokenizer = None
-    
+            self.llm_model_path = None
+            self.llm_diagnostic = str(e)
+
+    def _has_red_flags(self, text: str) -> bool:
+        """Lightweight red-flag detector reused for triage decisions."""
+        if not text:
+            return False
+        return any(pattern.search(text) for pattern in self.red_flag_patterns)
+
+    def _extract_guideline_sections(self, content: str) -> Tuple[List[str], List[str]]:
+        """Parse guideline text into immediate actions and warning signs."""
+        actions: List[str] = []
+        warnings: List[str] = []
+
+        if not content:
+            return actions, warnings
+
+        current: Optional[str] = None
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            upper = line.upper()
+            if "IMMEDIATE ACTION" in upper:
+                current = "actions"
+                continue
+            if "WARNING SIGN" in upper:
+                current = "warnings"
+                continue
+            if re.match(r"^(EMERGENCY LEVEL|PREVENTION|CALL 911|RISK FACTORS|PROGNOSIS|OUTLOOK)", upper):
+                current = None
+                continue
+
+            clean = re.sub(r"^[\-•\d\.\)\s]+", "", line)
+            if not clean:
+                continue
+
+            if current == "actions":
+                actions.append(clean)
+            elif current == "warnings":
+                warnings.append(clean)
+
+        return actions, warnings
+
     def _build_vector_index(self):
         """Build FAISS vector index from health guidelines"""
         try:
@@ -255,10 +441,12 @@ class LocalHealthRAG:
             self.doc_ids = doc_ids
             
             logger.info(f"✅ Vector index built with {len(documents)} documents")
-            
+            self.vector_index_size = len(documents)
+
         except Exception as e:
             logger.error(f"❌ Error building vector index: {e}")
             self.vector_index = None
+            self.vector_index_size = 0
     
     def _generate_response(self, prompt: str, max_length: int = 200) -> str:
         """Generate response using TinyLlama model"""
@@ -408,10 +596,11 @@ class LocalHealthRAG:
         
         try:
             logger.info(f"🚨 Health Emergency Query: {query[:100]}...")
-            
-            # Detect emergency type
+
+            # Detect emergency type & red flags up front
             emergency_type = self._detect_emergency_type(query)
-            
+            red_flags = self._has_red_flags(query)
+
             # Get relevant information
             if emergency_type and emergency_type in self.emergency_protocols:
                 # Emergency protocol response
@@ -432,31 +621,61 @@ class LocalHealthRAG:
                     "confidence": 0.9,
                     "source": "emergency_protocols",
                     "ai_response": ai_response,
-                    "processing_time": time.time() - start_time
+                    "processing_time": time.time() - start_time,
+                    "red_flags_triggered": red_flags,
+                    "primary_source": protocol.get("title"),
+                    "primary_source_actions": protocol.get("immediate_actions", [])[:3],
+                    "primary_source_warnings": protocol.get("warning_signs", [])[:5],
                 }
             else:
                 # General health query with hybrid search
                 hybrid_results = self._hybrid_search(query, k=5)
-                
+
                 # Generate AI response if model is available
                 ai_response = None
                 if self.llm_model is not None:
                     prompt = self._create_general_health_prompt(query)
                     ai_response = self._generate_response(prompt, max_length=150)
-                
+
+                top_actions: List[str] = []
+                top_warnings: List[str] = []
+                critical_hits: List[Dict[str, Any]] = []
+                primary_title: Optional[str] = None
+
+                for result_doc in hybrid_results:
+                    content_lower = (result_doc.get("content", "") or "").lower()
+                    score = float(result_doc.get("score", 0.0))
+                    if primary_title is None:
+                        primary_title = result_doc.get("title") or result_doc.get("guideline_id")
+                        top_actions, top_warnings = self._extract_guideline_sections(result_doc.get("content", ""))
+                    if score >= 0.6 and ("call 911" in content_lower or "emergency level: critical" in content_lower):
+                        critical_hits.append(result_doc)
+
+                call_911 = red_flags or bool(critical_hits)
+                confidence = max([float(r.get("score", 0.0)) for r in hybrid_results], default=0.35)
+                if not call_911:
+                    confidence = min(confidence, 0.55)
+
                 response = {
                     "emergency_type": "general_health",
                     "vector_results": hybrid_results,
-                    "call_911": any(r.get("emergency_level") == "critical" for r in hybrid_results),
-                    "confidence": max([r.get("score", 0) for r in hybrid_results], default=0.3),
+                    "call_911": call_911,
+                    "confidence": confidence,
                     "source": "hybrid_search",
                     "ai_response": ai_response,
-                    "processing_time": time.time() - start_time
+                    "processing_time": time.time() - start_time,
+                    "red_flags_triggered": red_flags,
+                    "primary_source": primary_title,
+                    "primary_source_actions": top_actions[:3],
+                    "primary_source_warnings": top_warnings[:5],
+                    "critical_evidence": critical_hits[:3],
+                    "immediate_actions": top_actions[:3],
+                    "warning_signs": top_warnings[:5],
                 }
-            
+
             # Add natural language response
             response["natural_response"] = self._format_natural_response(response, query)
-            
+
             return response
             
         except Exception as e:
@@ -541,23 +760,47 @@ Response:"""
             if vector_results:
                 best_result = vector_results[0]
                 content = best_result.get("content", "")
-                if len(content) > 200:
-                    content = content[:200] + "..."
-                return f"Based on your symptoms, here's relevant health information: {content}"
+                title = response.get("primary_source") or best_result.get("title", "relevant guidance")
+                snippet = " ".join(content.split())[:320]
+                if len(snippet) == 320:
+                    snippet = snippet.rsplit(" ", 1)[0] + "..."
+                actions = response.get("primary_source_actions", [])
+                warnings = response.get("primary_source_warnings", [])
+
+                parts = [
+                    f"Based on your description, the closest match is **{title}**.",
+                    snippet or "The guideline emphasises monitoring symptoms closely.",
+                ]
+                if actions:
+                    parts.append("Key immediate steps: " + "; ".join(actions[:3]))
+                if warnings:
+                    parts.append("Watch for: " + "; ".join(warnings[:3]))
+                parts.append("Contact a healthcare professional for personalised guidance.")
+
+                return " ".join(parts)
             else:
                 return "Your symptoms require medical attention and should be evaluated by a healthcare provider. While I cannot provide a specific diagnosis, it's important to take your symptoms seriously. If you're experiencing severe or worsening symptoms, call 911 or seek immediate medical care."
     
     def get_system_status(self) -> Dict[str, Any]:
         """Get system status"""
+        base_ready = bool(self.guidelines) and self.embedding_model is not None and self.vector_index is not None
+        llm_ready = self.llm_model is not None
         return {
             "guidelines_loaded": len(self.guidelines),
             "emergency_protocols": len(self.emergency_protocols),
-            "llm_model_loaded": self.llm_model is not None,
+            "llm_model_loaded": llm_ready,
+            "llm_model_path": str(self.llm_model_path) if self.llm_model_path else None,
+            "llm_diagnostic": self.llm_diagnostic,
             "embedding_model_loaded": self.embedding_model is not None,
+            "embedding_model_path": str(self.embedding_model_path) if self.embedding_model_path else None,
+            "embedding_diagnostic": self.embedding_diagnostic,
             "vector_index_built": self.vector_index is not None,
+            "vector_index_size": self.vector_index_size,
             "rag_anything_available": self.rag_anything_client.is_available(),
             "rag_anything_url": self.rag_anything_client.base_url,
-            "system_ready": True
+            "base_components_ready": base_ready,
+            "llm_ready": llm_ready,
+            "system_ready": base_ready and llm_ready
         }
 
 

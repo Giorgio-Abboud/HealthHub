@@ -3,8 +3,11 @@
 # Frontend sends JSON: { session_id, envelope: { user, chat[] } }
 # Not medical advice. Prototype only.
 
-import os, json, re
-from typing import Dict, List, Literal
+import os, json, re, time, logging
+from typing import Dict, List, Literal, Optional
+from uuid import uuid4
+
+import numpy as np
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator  # Pydantic v2
@@ -17,10 +20,18 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 # ─────────────────────────────────────────
 from src.local_rag_system import LocalHealthRAG
 
+logger = logging.getLogger(__name__)
+
 rag_system = LocalHealthRAG()
 status = rag_system.get_system_status()
-if not status.get("system_ready", False):
-    raise RuntimeError("LocalHealthRAG system is not ready. Check your setup.")
+if not status.get("base_components_ready", False):
+    raise RuntimeError("LocalHealthRAG base components failed to load. Check guidelines and embeddings.")
+if not status.get("llm_ready", False):
+    logger.warning("TinyLlama model not loaded; using fallback responses until weights are available.")
+
+# Guard attributes used for dynamic vector updates
+if not hasattr(rag_system, "doc_ids"):
+    rag_system.doc_ids = []  # type: ignore[attr-defined]
 
 # ─────────────────────────────────────────
 # Config
@@ -61,10 +72,15 @@ def _map_localrag_to_schema(result: Dict, user_text: str) -> Dict:
     confidence = float(result.get("confidence", 0.0))
     emer_raw   = (result.get("emergency_type") or "Uncertain").replace("_", " ").title()
 
-    if call_911 or has_red_flags(user_text):
+    red_flags = bool(result.get("red_flags_triggered")) or has_red_flags(user_text)
+    high_risk_type = emer_raw.lower() not in {"general health", "uncertain"}
+
+    if call_911 and (red_flags or (high_risk_type and confidence >= 0.45) or confidence >= 0.75):
         triage = "red"
+    elif confidence >= max(YELLOW_THRESHOLD, 0.45):
+        triage = "yellow"
     else:
-        triage = "yellow" if confidence > YELLOW_THRESHOLD else "green"
+        triage = "green"
 
     # citations from vector_results (optional)
     vr = result.get("vector_results", []) or []
@@ -74,14 +90,21 @@ def _map_localrag_to_schema(result: Dict, user_text: str) -> Dict:
         if src not in citations:
             citations.append(src)
 
+    if vr:
+        top_title = vr[0].get("title") or vr[0].get("guideline_id")
+    elif high_risk_type:
+        top_title = emer_raw
+    else:
+        top_title = "General Health"
+
     return {
         "triage_level": triage,  # red | yellow | green
         "top_conditions": [{
-            "code": emer_raw.upper().replace(" ", "_"),
-            "name": emer_raw,
+            "code": (top_title or emer_raw).upper().replace(" ", "_"),
+            "name": top_title or emer_raw,
             "confidence": confidence
         }],
-        "rationale": (result.get("natural_response") or "").strip()[:500] or "Limited information.",
+        "rationale": (result.get("natural_response") or "").strip()[:600] or "Limited information.",
         "citations": citations,
         "missing_critical_info": result.get("missing_info", ["onset_time","duration","severity_scale","associated_symptoms"]),
         "disclaimer": "Prototype only. Not medical advice."
@@ -117,12 +140,18 @@ def _format_rich_message(prediction: Dict, raw: Dict) -> str:
     if ia:
         parts.append("Immediate actions:")
         parts += [f"• {a}" for a in ia[:3]]
+    elif raw.get("primary_source_actions"):
+        parts.append("Immediate actions:")
+        parts += [f"• {a}" for a in raw.get("primary_source_actions", [])[:3]]
 
     # Warning signs
     ws = raw.get("warning_signs") or []
     if ws:
         parts.append("Warning signs to watch for:")
         parts += [f"• {w}" for w in ws[:5]]
+    elif raw.get("primary_source_warnings"):
+        parts.append("Warning signs to watch for:")
+        parts += [f"• {w}" for w in raw.get("primary_source_warnings", [])[:5]]
 
     # Care guidance
     if prediction["triage_level"] == "red" or raw.get("call_911"):
@@ -188,10 +217,77 @@ def _cap_window(hist: ChatMessageHistory, max_turns: int = CHAT_WINDOW_TURNS):
     if len(msgs) > max_turns:
         hist.messages = type(hist.messages)(msgs[-max_turns:])
 
+
+def _serialize_envelope(session_id: str, envelope: ChatEnvelope) -> str:
+    """Serialize the full chat payload for storage in the vector index."""
+    payload = {
+        "session_id": session_id,
+        "user": envelope.user.model_dump(),
+        "chat": [turn.model_dump() for turn in envelope.chat],
+        "timestamp": time.time(),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
+    """L2-normalize embeddings similar to faiss.normalize_L2."""
+    if embeddings.ndim == 1:
+        embeddings = embeddings.reshape(1, -1)
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms = np.clip(norms, 1e-6, None)
+    return embeddings / norms
+
+
+def _store_in_vector_db(session_id: str, envelope: ChatEnvelope) -> Optional[str]:
+    """Store the serialized envelope in the vector DB for retrieval."""
+    embedding_model = getattr(rag_system, "embedding_model", None)
+    vector_index = getattr(rag_system, "vector_index", None)
+
+    if embedding_model is None or vector_index is None:
+        return None
+
+    serialized = _serialize_envelope(session_id, envelope)
+    embedding = embedding_model.encode([serialized])
+    embedding = np.asarray(embedding, dtype="float32")
+    embedding = _normalize_embeddings(embedding)
+
+    vector_index.add(embedding)
+
+    doc_id = f"user_session::{session_id}::{uuid4().hex[:8]}"
+
+    # Persist metadata so LocalHealthRAG can surface it in results
+    rag_system.doc_ids.append(doc_id)  # type: ignore[attr-defined]
+    if hasattr(rag_system, "vector_index_size"):
+        rag_system.vector_index_size = len(rag_system.doc_ids)  # type: ignore[attr-defined]
+    rag_system.guidelines[doc_id] = {
+        "title": f"User session {session_id}",
+        "content": serialized,
+        "emergency_level": "user_session",
+        "source": "user_session",
+    }
+
+    # Keep a soft cap on dynamic documents to avoid unbounded growth
+    max_dynamic = 200
+    if len(rag_system.doc_ids) > max_dynamic:  # type: ignore[attr-defined]
+        overflow = len(rag_system.doc_ids) - max_dynamic  # type: ignore[attr-defined]
+        for _ in range(overflow):
+            old_doc_id = rag_system.doc_ids.pop(0)  # type: ignore[attr-defined]
+            rag_system.guidelines.pop(old_doc_id, None)
+            # No efficient way to delete from IndexFlatIP; entries remain but lose metadata
+
+    if hasattr(rag_system, "vector_index_size"):
+        rag_system.vector_index_size = len(rag_system.doc_ids)  # type: ignore[attr-defined]
+
+    return doc_id
+
 # ─────────────────────────────────────────
 # FastAPI
 # ─────────────────────────────────────────
 app = FastAPI()
+
+# Default host/port for manual execution (falls back to 0.0.0.0:8000)
+DEFAULT_HOST = os.getenv("PREDICTION_HOST", "0.0.0.0")
+DEFAULT_PORT = int(os.getenv("PREDICTION_PORT", os.getenv("PORT", "8000")))
 
 @app.post("/chat")
 async def chat(req: ChatReq):
@@ -212,6 +308,9 @@ async def chat(req: ChatReq):
     last_user_msg = next((t.content for t in reversed(req.envelope.chat) if t.role == "user"), None)
     if not last_user_msg:
         raise HTTPException(status_code=400, detail="No user message found in 'chat'.")
+
+    # Store the entire envelope in the vector database for continual learning
+    stored_doc_id = _store_in_vector_db(session_id, req.envelope)
 
     # Keep history manually and cap
     hist = get_history(session_id)
@@ -240,20 +339,37 @@ async def chat(req: ChatReq):
     _cap_window(hist, CHAT_WINDOW_TURNS)
 
     # Return both text and structured data so the UI can render it nicely
+    model_name = "TinyLlama" if getattr(rag_system, "llm_model", None) else "RuleBasedFallback"
     return {
         "output": message,
         "data": {
             "prediction": prediction,
             "input_bundle": {"profile": profile_json, "current_input": last_user_msg},
-            "model_info": {"provider": "localrag", "model_name": "LocalHealthRAG", "prompt_version": "v2-rich"},
+            "model_info": {
+                "provider": "localrag",
+                "model_name": model_name,
+                "prompt_version": "v2-rich",
+            },
+            "rag_status": rag_system.get_system_status(),
             # Raw fields that UIs can present directly:
             "emergency_type": result.get("emergency_type"),
             "call_911": bool(result.get("call_911")),
             "confidence": float(result.get("confidence", 0.0)),
             "immediate_actions": result.get("immediate_actions", []),
             "warning_signs": result.get("warning_signs", []),
+            "primary_source": result.get("primary_source"),
+            "primary_source_actions": result.get("primary_source_actions", []),
+            "primary_source_warnings": result.get("primary_source_warnings", []),
             "vector_results": (result.get("vector_results") or [])[:5],
             "user_id": user_id,
             "session_id": session_id,
+            "vector_document_id": stored_doc_id,
         }
     }
+
+
+if __name__ == "__main__":
+    # Convenience entry point so `python agent/prediction.py` listens on 0.0.0.0:8000
+    import uvicorn
+
+    uvicorn.run(app, host=DEFAULT_HOST, port=DEFAULT_PORT, log_level="info")
