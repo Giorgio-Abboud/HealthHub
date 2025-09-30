@@ -13,9 +13,15 @@ import logging
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from sentence_transformers import SentenceTransformer
-import faiss
 import os
 import requests
+
+try:  # pragma: no cover - optional dependency on some platforms
+    import faiss  # type: ignore
+    _FAISS_AVAILABLE = True
+except ImportError:  # pragma: no cover - handled gracefully in code
+    faiss = None  # type: ignore
+    _FAISS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +31,7 @@ class RAGAnythingClient:
     def __init__(self, base_url: str = "http://localhost:9999"):
         self.base_url = base_url.rstrip("/")
         self.available = False
+        self._last_error: Optional[str] = None
         self._test_connection()
     
     def _test_connection(self):
@@ -33,12 +40,23 @@ class RAGAnythingClient:
             resp = requests.get(f"{self.base_url}/health", timeout=5)
             if resp.status_code == 200:
                 self.available = True
+                self._last_error = None
                 logger.info("✅ RAG-Anything server connected")
             else:
-                logger.warning("⚠️ RAG-Anything server responded with non-200 status")
+                self._last_error = f"healthcheck status {resp.status_code}"
+                logger.info(
+                    "ℹ️ RAG-Anything server not ready (optional integration disabled: %s)",
+                    self._last_error,
+                )
         except Exception as e:
-            logger.warning(f"⚠️ RAG-Anything server unavailable: {e}")
+            # Network hiccups here should not be alarming to end users running the
+            # local experience without the optional RAG-Anything process.
+            self._last_error = str(e)
             self.available = False
+            logger.info(
+                "ℹ️ RAG-Anything server unavailable (optional integration disabled): %s",
+                self._last_error,
+            )
     
     def retrieve(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         """
@@ -84,6 +102,11 @@ class RAGAnythingClient:
         """Check if RAG-Anything server is available"""
         return self.available
 
+    @property
+    def last_error(self) -> Optional[str]:
+        """Last recorded connection error message (if any)."""
+        return self._last_error
+
 class LocalHealthRAG:
     """Complete local RAG system with TinyLlama, embeddings, and vector search"""
 
@@ -117,8 +140,16 @@ class LocalHealthRAG:
         # Initialize components
         self.llm_model = None
         self.llm_tokenizer = None
+        self.llm_model_path: Optional[str] = None
+        self.llm_error: Optional[str] = None
+
         self.embedding_model = None
+        self.embedding_model_path: Optional[str] = None
+        self.embedding_error: Optional[str] = None
+
         self.vector_index = None
+        self.vector_index_error: Optional[str] = None
+        self._faiss_available = _FAISS_AVAILABLE
         self.guidelines: Dict[str, Dict[str, Any]] = {}
         self.emergency_protocols: Dict[str, Dict[str, Any]] = {}
         self.doc_ids: List[str] = []
@@ -141,7 +172,10 @@ class LocalHealthRAG:
         logger.info(f"🤖 TinyLlama Model: {'Loaded' if self.llm_model is not None else 'Not Available'}")
         logger.info(f"🔍 Embedding Model: {'Loaded' if self.embedding_model is not None else 'Not Available'}")
         logger.info(f"📊 Vector Index: {'Built' if self.vector_index is not None else 'Not Available'}")
-        logger.info(f"🌐 RAG-Anything Server: {'Connected' if self.rag_anything_client.is_available() else 'Not Available'}")
+        rag_anything_status = "Connected" if self.rag_anything_client.is_available() else "Not Available"
+        if not self.rag_anything_client.is_available() and self.rag_anything_client.last_error:
+            rag_anything_status += f" (reason: {self.rag_anything_client.last_error})"
+        logger.info(f"🌐 RAG-Anything Server: {rag_anything_status}")
 
     def _resolve_directory(self, configured_path: str, fallback_subdirs: Sequence[Path]) -> Path:
         """Resolve a directory by checking several repo-relative fallbacks."""
@@ -251,6 +285,8 @@ class LocalHealthRAG:
             return False
         config_exists = (path / "config.json").exists()
         safetensor_exists = any(path.glob("*.safetensors"))
+        if not safetensor_exists:
+            safetensor_exists = any(path.rglob("*.safetensors"))
         tokenizer_exists = any((path / name).exists() for name in [
             "tokenizer.json",
             "tokenizer_config.json",
@@ -265,6 +301,8 @@ class LocalHealthRAG:
             return False
         config_exists = (path / "config.json").exists() or (path / "config_sentence_transformers.json").exists()
         safetensor_exists = any(path.glob("*.safetensors"))
+        if not safetensor_exists:
+            safetensor_exists = any(path.rglob("*.safetensors"))
         modules_file = (path / "modules.json").exists()
         return config_exists and safetensor_exists and modules_file
 
@@ -297,11 +335,15 @@ class LocalHealthRAG:
         try:
             logger.info("🔄 Loading embedding model...")
 
+            self.embedding_error = None
+            self.embedding_model_path = None
+
             errors: List[str] = []
             for candidate in self._discover_embedding_candidates():
                 try:
                     self.embedding_model = SentenceTransformer(str(candidate))
                     logger.info(f"✅ Embedding model loaded from {candidate}")
+                    self.embedding_model_path = str(candidate)
                     return
                 except Exception as candidate_error:  # pragma: no cover - logging only
                     errors.append(f"{candidate}: {candidate_error}")
@@ -309,6 +351,7 @@ class LocalHealthRAG:
             # Fall back to the configured name (may be a Hugging Face identifier or absolute path)
             self.embedding_model = SentenceTransformer(self.embedding_model_name)
             logger.info(f"✅ Embedding model loaded using identifier '{self.embedding_model_name}'")
+            self.embedding_model_path = self.embedding_model_name
 
         except Exception as e:
             if errors:
@@ -316,13 +359,17 @@ class LocalHealthRAG:
                     logger.warning(f"⚠️ Candidate embedding load failed: {err}")
             logger.error(f"❌ Error loading embedding model: {e}")
             self.embedding_model = None
-    
+            self.embedding_error = str(e)
+
     def _load_tinyllama_model(self):
         """Load TinyLlama model for local inference (macOS compatible)"""
         try:
             # Find model path
             model_path = None
             errors: List[str] = []
+
+            self.llm_error = None
+            self.llm_model_path = None
 
             for candidate in self._discover_llm_candidates():
                 try:
@@ -343,15 +390,17 @@ class LocalHealthRAG:
                     model_path = candidate
                     self.llm_tokenizer = tokenizer
                     self.llm_model = model
+                    self.llm_model_path = str(candidate)
                     break
                 except Exception as candidate_error:  # pragma: no cover - logging only
                     errors.append(f"{candidate}: {candidate_error}")
 
             if model_path is None:
-                logger.warning("⚠️ TinyLlama model not found, using fallback responses")
+                logger.info("ℹ️ TinyLlama model not found locally; falling back to rule-based responses")
                 if errors:
                     for err in errors:
-                        logger.warning(f"⚠️ Candidate TinyLlama load failed: {err}")
+                        logger.debug(f"TinyLlama candidate skipped: {err}")
+                self.llm_error = "TinyLlama checkpoint not found on disk"
                 return
 
             # Set pad token
@@ -364,20 +413,29 @@ class LocalHealthRAG:
             logger.info(f"✅ TinyLlama model loaded successfully from {model_path} (CPU mode)")
             
         except Exception as e:
-            logger.warning(f"⚠️ TinyLlama model loading failed: {e}")
-            logger.info("💡 Using rule-based responses instead of AI-generated text")
+            logger.info("ℹ️ TinyLlama model loading failed; using rule-based responses instead: %s", e)
             self.llm_model = None
             self.llm_tokenizer = None
-    
+            self.llm_error = str(e)
+
     def _build_vector_index(self):
         """Build FAISS vector index from health guidelines"""
         try:
+            if not self._faiss_available:
+                self.vector_index_error = "faiss library not available"
+                logger.warning("⚠️ Cannot build vector index: faiss library is not installed")
+                return
+
             if not self.embedding_model or not self.guidelines:
                 logger.warning("⚠️ Cannot build vector index: missing embedding model or guidelines")
+                if not self.embedding_model and not self.embedding_error:
+                    self.vector_index_error = "embedding model unavailable"
+                elif not self.guidelines:
+                    self.vector_index_error = "no guidelines loaded"
                 return
-            
+
             logger.info("🔄 Building vector index...")
-            
+
             # Prepare documents
             documents = []
             doc_ids = []
@@ -390,8 +448,9 @@ class LocalHealthRAG:
             
             if not documents:
                 logger.warning("⚠️ No documents to index")
+                self.vector_index_error = "no documents available for indexing"
                 return
-            
+
             # Generate embeddings
             embeddings = self.embedding_model.encode(documents)
             
@@ -405,12 +464,14 @@ class LocalHealthRAG:
             
             # Store document IDs
             self.doc_ids = doc_ids
-            
+
             logger.info(f"✅ Vector index built with {len(documents)} documents")
-            
+            self.vector_index_error = None
+
         except Exception as e:
             logger.error(f"❌ Error building vector index: {e}")
             self.vector_index = None
+            self.vector_index_error = str(e)
     
     def _generate_response(self, prompt: str, max_length: int = 200) -> str:
         """Generate response using TinyLlama model"""
@@ -658,46 +719,72 @@ Response:"""
     
     def _format_natural_response(self, response: Dict[str, Any], query: str) -> str:
         """Format natural language response"""
-        # Use AI response if available
-        if response.get("ai_response") and response["ai_response"] != "Model not available for text generation.":
-            return response["ai_response"]
-        
-        # Fallback to rule-based responses
+        ai_message = response.get("ai_response")
+        if ai_message and ai_message != "Model not available for text generation.":
+            return ai_message
+
+        query_clean = (query or "").strip()
         emergency_type = response.get("emergency_type", "general_health")
-        call_911 = response.get("call_911", False)
-        
-        if emergency_type == "chest_pain":
-            if call_911:
-                return "Based on your symptoms, this appears to be a potential heart attack or cardiac emergency. Chest pain with breathing difficulties is a serious medical emergency that requires immediate attention. You should call 911 right away and try to stay calm while waiting for help."
+        protocol = response.get("protocol") or self.emergency_protocols.get(emergency_type)
+        call_911 = bool(response.get("call_911"))
+
+        if protocol:
+            title = protocol.get("title") or emergency_type.replace("_", " ").title()
+            actions = [a for a in protocol.get("immediate_actions", []) if a][:3]
+            warnings = [w for w in protocol.get("warning_signs", []) if w][:3]
+
+            parts = []
+            if query_clean:
+                parts.append(
+                    f"You mentioned: \"{query_clean}\". This lines up with our {title.lower()} guidance, "
+                    "which treats these symptoms as urgent."
+                )
             else:
-                return "Your chest pain symptoms could indicate several conditions ranging from heartburn to anxiety. However, any chest pain should be taken seriously and evaluated by a healthcare provider. Monitor your symptoms closely and seek medical attention if they worsen."
-        
-        elif emergency_type == "shortness_breath":
-            return "Your symptoms of shortness of breath could indicate several serious conditions including respiratory problems, heart issues, or shock. These symptoms suggest your body may not be getting enough oxygen, which is a medical emergency. You should call 911 immediately and try to stay calm while waiting for help."
-        
-        elif emergency_type == "fainting":
+                parts.append(
+                    f"This matches our {title.lower()} guidance, which treats these symptoms as urgent."
+                )
+
             if call_911:
-                return "Fainting with potential head injury is a serious medical emergency that requires immediate attention. Loss of consciousness can indicate various serious conditions including head trauma, cardiac issues, or neurological problems. Call 911 immediately and while waiting, check if the person is breathing."
-            else:
-                return "Fainting episodes can have various causes including dehydration, low blood pressure, or stress. However, any loss of consciousness should be evaluated by a healthcare provider to rule out serious conditions. Monitor the person closely and seek medical attention if symptoms persist."
-        
-        elif emergency_type == "choking":
-            return "Choking is a life-threatening emergency that requires immediate action. When someone cannot speak or breathe due to a blocked airway, every second counts. Call 911 immediately and perform the Heimlich maneuver if you're trained to do so, or encourage the person to cough forcefully."
-        
-        elif emergency_type == "stroke":
-            return "Facial drooping is a classic sign of stroke, which is a medical emergency that requires immediate treatment. Time is critical with strokes - the sooner treatment begins, the better the outcome. Call 911 immediately and note the time when symptoms started, as this information is crucial for treatment decisions."
-        
+                parts.append(
+                    "Call 911 or your local emergency number immediately and stay with someone who can help."
+                )
+            elif emergency_type != "general_health":
+                parts.append(
+                    "Seek urgent medical evaluation as soon as possible to rule out serious causes."
+                )
+
+            if actions:
+                parts.append("Key immediate steps: " + "; ".join(actions))
+
+            if warnings:
+                parts.append("Watch for: " + "; ".join(warnings) + ".")
+
+            return " ".join(part.strip() for part in parts if part)
+
+        vector_results = response.get("vector_results", []) or []
+        if vector_results:
+            best_result = next((r for r in vector_results if r.get("content")), vector_results[0])
+            content = best_result.get("content", "").strip()
+            if len(content) > 220:
+                content = content[:220].rstrip() + "..."
+            source = best_result.get("title") or best_result.get("source") or "a trusted health reference"
+            base = (
+                f"I found guidance from {source} that matches your message. "
+                f"Key points: {content}"
+            )
+            if call_911:
+                base += " If symptoms escalate or you feel unsafe, call emergency services."
+            return base
+
+        general_notice = (
+            "I'm using fallback guidance because the local language model isn't available. "
+            "Your symptoms should be reviewed by a healthcare professional."
+        )
+        if call_911:
+            general_notice += " If anything worsens or feels life-threatening, call 911 right away."
         else:
-            # General health response
-            vector_results = response.get("vector_results", [])
-            if vector_results:
-                best_result = vector_results[0]
-                content = best_result.get("content", "")
-                if len(content) > 200:
-                    content = content[:200] + "..."
-                return f"Based on your symptoms, here's relevant health information: {content}"
-            else:
-                return "Your symptoms require medical attention and should be evaluated by a healthcare provider. While I cannot provide a specific diagnosis, it's important to take your symptoms seriously. If you're experiencing severe or worsening symptoms, call 911 or seek immediate medical care."
+            general_notice += " Arrange medical evaluation soon and monitor for any new warning signs."
+        return general_notice
     
     def get_system_status(self) -> Dict[str, Any]:
         """Get system status"""
@@ -705,10 +792,17 @@ Response:"""
             "guidelines_loaded": len(self.guidelines),
             "emergency_protocols": len(self.emergency_protocols),
             "llm_model_loaded": self.llm_model is not None,
+            "llm_model_path": self.llm_model_path,
+            "llm_error": self.llm_error,
             "embedding_model_loaded": self.embedding_model is not None,
+            "embedding_model_path": self.embedding_model_path,
+            "embedding_error": self.embedding_error,
             "vector_index_built": self.vector_index is not None,
+            "vector_index_error": self.vector_index_error,
+            "faiss_available": self._faiss_available,
             "rag_anything_available": self.rag_anything_client.is_available(),
             "rag_anything_url": self.rag_anything_client.base_url,
+            "rag_anything_error": self.rag_anything_client.last_error,
             "system_ready": True
         }
 

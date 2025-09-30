@@ -3,8 +3,9 @@
 # No database. Frontend sends strict JSON: { session_id, envelope: { user, chat[] } }
 # Not medical advice. Prototype only.
 
-import os, json, re, asyncio
-from typing import Dict, List, Literal
+import os, json, re, asyncio, logging
+from functools import lru_cache
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator  # Pydantic v2
@@ -12,6 +13,10 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain.memory import ChatMessageHistory
+
+from .local_rag_system import LocalHealthRAG
+
+log = logging.getLogger(__name__)
 from langchain.tools import StructuredTool
 
 # ─────────────────────────────────────────
@@ -246,6 +251,110 @@ _histories: Dict[str, ChatMessageHistory] = {}
 def get_history(session_id: str) -> ChatMessageHistory:
     return _histories.setdefault(session_id, ChatMessageHistory())
 
+
+@lru_cache(maxsize=1)
+def get_local_rag() -> Optional[LocalHealthRAG]:
+    """Lazily instantiate the LocalHealthRAG system for chat responses."""
+    try:
+        rag = LocalHealthRAG()
+        log.info("LocalHealthRAG initialized for chat responses.")
+        return rag
+    except Exception as exc:  # pragma: no cover - diagnostic logging path
+        log.exception("Failed to initialize LocalHealthRAG: %s", exc)
+        return None
+
+
+def _ensure_disclaimer(message: str) -> str:
+    msg = (message or "").strip()
+    if not msg:
+        return "Not medical advice."
+    if not msg.lower().endswith("not medical advice."):
+        msg = f"{msg}\n\nNot medical advice."
+    return msg
+
+
+def _format_actions(actions: List[str]) -> Optional[str]:
+    filtered = [a.strip() for a in actions if a and a.strip()]
+    if not filtered:
+        return None
+    return "Immediate steps: " + "; ".join(filtered)
+
+
+def _format_reference_snippet(vector_results: List[Dict[str, Any]]) -> Optional[str]:
+    if not vector_results:
+        return None
+    top = next((r for r in vector_results if r.get("content")), None)
+    if not top:
+        return None
+    content = top["content"].strip()
+    if len(content) > 320:
+        content = content[:320].rstrip() + "..."
+    source = top.get("source") or top.get("title") or "reference"
+    return f"Reference ({source}): {content}"
+
+
+def _compose_chat_reply(user_text: str, rag_payload: Dict[str, Any]) -> str:
+    if not rag_payload:
+        return ""
+
+    parts: List[str] = []
+    natural = rag_payload.get("natural_response")
+    if natural:
+        parts.append(natural.strip())
+
+    actions = rag_payload.get("immediate_actions")
+    if not actions and isinstance(rag_payload.get("protocol"), dict):
+        actions = rag_payload["protocol"].get("immediate_actions", [])
+    formatted_actions = _format_actions(actions or [])
+    if formatted_actions:
+        parts.append(formatted_actions)
+
+    if rag_payload.get("warning_signs"):
+        warnings = ", ".join(w for w in rag_payload["warning_signs"] if w)
+        if warnings:
+            parts.append(f"Watch for: {warnings}.")
+
+    if rag_payload.get("call_911"):
+        parts.append("⚠️ These symptoms may require emergency care. Call 911 or local emergency services if they worsen or you feel unsafe.")
+
+    reference = _format_reference_snippet(rag_payload.get("vector_results") or [])
+    if reference:
+        parts.append(reference)
+
+    combined = "\n\n".join(p for p in parts if p)
+    return _ensure_disclaimer(combined)
+
+
+def _default_generic_response(user_text: str) -> str:
+    base = "I'm having trouble accessing the detailed guidance right now."
+    if has_red_flags(user_text):
+        base += " Your description sounds concerning, so please seek emergency medical care immediately."
+    else:
+        base += " Please consult a healthcare professional for personal medical guidance and monitor your symptoms."
+    return _ensure_disclaimer(base)
+
+
+async def _rag_chat_response(session_id: str, user_text: str) -> Dict[str, Any]:
+    """Handle a chat turn using the LocalHealthRAG system when available."""
+    history = get_history(session_id)
+    history.add_user_message(user_text)
+
+    rag = get_local_rag()
+    rag_payload: Optional[Dict[str, Any]] = None
+    reply_text = ""
+
+    if rag is not None:
+        rag_payload = await asyncio.to_thread(rag.query_health_emergency, user_text)
+        reply_text = _compose_chat_reply(user_text, rag_payload)
+
+    if not reply_text:
+        reply_text = _default_generic_response(user_text)
+
+    history.add_ai_message(reply_text)
+    _cap_window(history)
+
+    return {"output": reply_text}
+
 def _cap_window(hist: ChatMessageHistory, max_turns: int = CHAT_WINDOW_TURNS):
     msgs = list(hist.messages)
     if len(msgs) > max_turns:
@@ -275,14 +384,21 @@ async def router_fn(inputs: dict):
     session_id = inputs.get("session_id", "default")
     profile_json = inputs["profile"]  # required
 
+    chat_result: Optional[Dict[str, Any]] = None
+
     # Emergency check
     if has_red_flags(text):
-        res = await chat_with_memory.ainvoke({"input": text}, config={"configurable":{"session_id": session_id}})
-        out = res["output"]
+        chat_result = await _rag_chat_response(session_id, text)
+        out = chat_result["output"]
         if "emergency" not in out.lower():
-            out += ("\n\n⚠️ If you’re experiencing severe or worsening symptoms (e.g., severe chest pain, "
-                    "trouble breathing, stroke-like symptoms), please seek emergency care now. Not medical advice.")
-        return {"output": out}
+            caution = ("If you’re experiencing severe or worsening symptoms (for example severe chest pain, "
+                       "trouble breathing, or stroke-like signs), please seek emergency care now.")
+            if caution not in out:
+                out = f"{out.rstrip()}\n\n⚠️ {caution}"
+        if not out.lower().strip().endswith("not medical advice."):
+            out = f"{out.rstrip()}\n\nNot medical advice."
+        chat_result["output"] = out
+        return chat_result
 
     # Ask for assessment → call ADK tool
     if DIAG_RE.search(text):
@@ -303,7 +419,7 @@ async def router_fn(inputs: dict):
         return {"output": summary, "data": data}
 
     # Normal chat
-    return await chat_with_memory.ainvoke({"input": text}, config={"configurable":{"session_id": session_id}})
+    return await _rag_chat_response(session_id, text)
 
 router = RunnableLambda(router_fn)
 
