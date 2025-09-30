@@ -20,7 +20,9 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 # ─────────────────────────────────────────
 # In-process RAG pipeline (your code)
 # ─────────────────────────────────────────
-from src.local_rag_system import LocalHealthRAG
+from .src.local_rag_system import LocalHealthRAG
+
+log = logging.getLogger(__name__)
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +66,7 @@ def _summarize_candidate_path(path: Path) -> Dict[str, Any]:
 if not status.get("system_ready", False):
     raise RuntimeError("LocalHealthRAG system is not ready. Check your setup.")
 
+
 if not status.get("llm_model_loaded", False):
     llm_error = status.get("llm_error")
     candidate_fn = getattr(rag_system, "_discover_llm_candidates", None)
@@ -92,6 +95,7 @@ if not status.get("llm_model_loaded", False):
     )
 
     log.error("TinyLlama failed to load: %s", json.dumps(LLM_DIAGNOSTICS, indent=2))
+
 
 log.info("LocalHealthRAG component status: %s", json.dumps(status, indent=2))
 
@@ -340,6 +344,7 @@ async def health() -> Dict[str, Any]:
         payload["llm_error"] = LLM_STARTUP_ERROR
         payload["llm_diagnostics"] = LLM_DIAGNOSTICS
     return payload
+
 
 @app.post("/chat")
 async def chat(req: ChatReq):

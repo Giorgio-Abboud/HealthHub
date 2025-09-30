@@ -401,6 +401,7 @@ class LocalHealthRAG:
                     for err in errors:
                         logger.debug(f"TinyLlama candidate skipped: {err}")
                 self.llm_error = "TinyLlama checkpoint not found on disk"
+
                 return
 
             # Set pad token
