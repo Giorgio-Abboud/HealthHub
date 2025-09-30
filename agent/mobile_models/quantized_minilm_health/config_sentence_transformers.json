@@ -1,10 +1,10 @@
 {
-  "__version__": {
-    "sentence_transformers": "5.1.0",
-    "transformers": "4.56.1",
-    "pytorch": "2.8.0+cu126"
-  },
   "model_type": "SentenceTransformer",
+  "__version__": {
+    "sentence_transformers": "5.1.1",
+    "transformers": "4.56.2",
+    "pytorch": "2.8.0+cu128"
+  },
   "prompts": {
     "query": "",
     "document": ""
