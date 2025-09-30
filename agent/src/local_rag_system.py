@@ -720,46 +720,72 @@ Response:"""
     
     def _format_natural_response(self, response: Dict[str, Any], query: str) -> str:
         """Format natural language response"""
-        # Use AI response if available
-        if response.get("ai_response") and response["ai_response"] != "Model not available for text generation.":
-            return response["ai_response"]
-        
-        # Fallback to rule-based responses
+        ai_message = response.get("ai_response")
+        if ai_message and ai_message != "Model not available for text generation.":
+            return ai_message
+
+        query_clean = (query or "").strip()
         emergency_type = response.get("emergency_type", "general_health")
-        call_911 = response.get("call_911", False)
-        
-        if emergency_type == "chest_pain":
-            if call_911:
-                return "Based on your symptoms, this appears to be a potential heart attack or cardiac emergency. Chest pain with breathing difficulties is a serious medical emergency that requires immediate attention. You should call 911 right away and try to stay calm while waiting for help."
+        protocol = response.get("protocol") or self.emergency_protocols.get(emergency_type)
+        call_911 = bool(response.get("call_911"))
+
+        if protocol:
+            title = protocol.get("title") or emergency_type.replace("_", " ").title()
+            actions = [a for a in protocol.get("immediate_actions", []) if a][:3]
+            warnings = [w for w in protocol.get("warning_signs", []) if w][:3]
+
+            parts = []
+            if query_clean:
+                parts.append(
+                    f"You mentioned: \"{query_clean}\". This lines up with our {title.lower()} guidance, "
+                    "which treats these symptoms as urgent."
+                )
             else:
-                return "Your chest pain symptoms could indicate several conditions ranging from heartburn to anxiety. However, any chest pain should be taken seriously and evaluated by a healthcare provider. Monitor your symptoms closely and seek medical attention if they worsen."
-        
-        elif emergency_type == "shortness_breath":
-            return "Your symptoms of shortness of breath could indicate several serious conditions including respiratory problems, heart issues, or shock. These symptoms suggest your body may not be getting enough oxygen, which is a medical emergency. You should call 911 immediately and try to stay calm while waiting for help."
-        
-        elif emergency_type == "fainting":
+                parts.append(
+                    f"This matches our {title.lower()} guidance, which treats these symptoms as urgent."
+                )
+
             if call_911:
-                return "Fainting with potential head injury is a serious medical emergency that requires immediate attention. Loss of consciousness can indicate various serious conditions including head trauma, cardiac issues, or neurological problems. Call 911 immediately and while waiting, check if the person is breathing."
-            else:
-                return "Fainting episodes can have various causes including dehydration, low blood pressure, or stress. However, any loss of consciousness should be evaluated by a healthcare provider to rule out serious conditions. Monitor the person closely and seek medical attention if symptoms persist."
-        
-        elif emergency_type == "choking":
-            return "Choking is a life-threatening emergency that requires immediate action. When someone cannot speak or breathe due to a blocked airway, every second counts. Call 911 immediately and perform the Heimlich maneuver if you're trained to do so, or encourage the person to cough forcefully."
-        
-        elif emergency_type == "stroke":
-            return "Facial drooping is a classic sign of stroke, which is a medical emergency that requires immediate treatment. Time is critical with strokes - the sooner treatment begins, the better the outcome. Call 911 immediately and note the time when symptoms started, as this information is crucial for treatment decisions."
-        
+                parts.append(
+                    "Call 911 or your local emergency number immediately and stay with someone who can help."
+                )
+            elif emergency_type != "general_health":
+                parts.append(
+                    "Seek urgent medical evaluation as soon as possible to rule out serious causes."
+                )
+
+            if actions:
+                parts.append("Key immediate steps: " + "; ".join(actions))
+
+            if warnings:
+                parts.append("Watch for: " + "; ".join(warnings) + ".")
+
+            return " ".join(part.strip() for part in parts if part)
+
+        vector_results = response.get("vector_results", []) or []
+        if vector_results:
+            best_result = next((r for r in vector_results if r.get("content")), vector_results[0])
+            content = best_result.get("content", "").strip()
+            if len(content) > 220:
+                content = content[:220].rstrip() + "..."
+            source = best_result.get("title") or best_result.get("source") or "a trusted health reference"
+            base = (
+                f"I found guidance from {source} that matches your message. "
+                f"Key points: {content}"
+            )
+            if call_911:
+                base += " If symptoms escalate or you feel unsafe, call emergency services."
+            return base
+
+        general_notice = (
+            "I'm using fallback guidance because the local language model isn't available. "
+            "Your symptoms should be reviewed by a healthcare professional."
+        )
+        if call_911:
+            general_notice += " If anything worsens or feels life-threatening, call 911 right away."
         else:
-            # General health response
-            vector_results = response.get("vector_results", [])
-            if vector_results:
-                best_result = vector_results[0]
-                content = best_result.get("content", "")
-                if len(content) > 200:
-                    content = content[:200] + "..."
-                return f"Based on your symptoms, here's relevant health information: {content}"
-            else:
-                return "Your symptoms require medical attention and should be evaluated by a healthcare provider. While I cannot provide a specific diagnosis, it's important to take your symptoms seriously. If you're experiencing severe or worsening symptoms, call 911 or seek immediate medical care."
+            general_notice += " Arrange medical evaluation soon and monitor for any new warning signs."
+        return general_notice
     
     def get_system_status(self) -> Dict[str, Any]:
         """Get system status"""
