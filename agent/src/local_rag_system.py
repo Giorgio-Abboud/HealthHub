@@ -117,16 +117,11 @@ class LocalHealthRAG:
         # Initialize components
         self.llm_model = None
         self.llm_tokenizer = None
-        self.llm_model_path: Optional[Path] = None
         self.embedding_model = None
-        self.embedding_model_path: Optional[Path] = None
-        self.embedding_diagnostic: Optional[str] = None
         self.vector_index = None
-        self.vector_index_size: int = 0
         self.guidelines: Dict[str, Dict[str, Any]] = {}
         self.emergency_protocols: Dict[str, Dict[str, Any]] = {}
         self.doc_ids: List[str] = []
-        self.llm_diagnostic: Optional[str] = None
         
         logger.info(f"📁 Models directory resolved to: {self.models_dir}")
         logger.info(f"📂 Data directory resolved to: {self.data_dir}")
@@ -178,74 +173,6 @@ class LocalHealthRAG:
         # Fall back to the first candidate even if it does not exist yet
         return candidates[0] if candidates else self._repo_root
 
-    def _looks_like_llm_dir(self, path: Path) -> bool:
-        """Heuristic to determine if a directory holds a causal language model."""
-        if not path.exists() or not path.is_dir():
-            return False
-
-        config_file = path / "config.json"
-        weight_files = [
-            path / "pytorch_model.bin",
-            path / "model.safetensors",
-        ]
-
-        if not config_file.exists():
-            return False
-
-        return any(w.exists() for w in weight_files)
-
-    def _discover_llm_candidates(self) -> List[Path]:
-        """Return likely directories that contain a TinyLlama-compatible model."""
-        env_override = os.getenv("LOCAL_LLM_PATH")
-        candidates: List[Path] = []
-
-        if env_override:
-            candidates.append(Path(env_override).expanduser())
-
-        static_candidates = [
-            self.models_dir / "quantized_tinyllama_health",
-            self.models_dir / "tinyllama",
-            self.models_dir / "TinyLlama",
-            self.models_dir / "TinyLlama-1.1B-Chat-v1.0",
-            self.models_dir / "tinyllama-1.1b-chat-v1.0",
-            self.models_dir / "qwen2_5_0_5b",
-            Path("agent") / "mobile_models" / "quantized_tinyllama_health",
-            Path("agent") / "mobile_models" / "TinyLlama",
-            Path("agent") / "mobile_models" / "TinyLlama-1.1B-Chat-v1.0",
-            Path("mobile_models") / "quantized_tinyllama_health",
-        ]
-
-        for candidate in static_candidates:
-            resolved = candidate.resolve(strict=False)
-            if resolved not in candidates:
-                candidates.append(resolved)
-
-        # Only return directories that look like actual LLM repos
-        return [c for c in candidates if self._looks_like_llm_dir(c)]
-
-    def _discover_embedding_candidates(self) -> List[Path]:
-        """Return likely directories that contain a sentence-transformer embedding model."""
-        env_override = os.getenv("LOCAL_EMBEDDING_PATH")
-        candidates: List[Path] = []
-
-        if env_override:
-            candidates.append(Path(env_override).expanduser())
-
-        static_candidates = [
-            self.models_dir / "quantized_minilm_health",
-            self.models_dir / self.embedding_model_name,
-            Path("agent") / "mobile_models" / "quantized_minilm_health",
-            Path("agent") / "mobile_models" / self.embedding_model_name,
-            Path("mobile_models") / "quantized_minilm_health",
-        ]
-
-        for candidate in static_candidates:
-            resolved = candidate.resolve(strict=False)
-            if resolved not in candidates and resolved.exists():
-                candidates.append(resolved)
-
-        return candidates
-
     def _load_health_data(self):
         """Load health guidelines and emergency protocols"""
         try:
@@ -273,48 +200,42 @@ class LocalHealthRAG:
     def _load_embedding_model(self):
         """Load sentence transformer model for embeddings"""
         try:
-            candidates = self._discover_embedding_candidates()
-            if candidates:
-                chosen = candidates[0]
-                logger.info(f"🔄 Loading embedding model from {chosen}...")
-                self.embedding_model = SentenceTransformer(str(chosen))
-                self.embedding_model_path = chosen
-                self.embedding_diagnostic = f"loaded from {chosen}"
-            else:
-                logger.info(f"🔄 Loading embedding model by name: {self.embedding_model_name}")
-                self.embedding_model = SentenceTransformer(self.embedding_model_name)
-                self.embedding_model_path = None
-                self.embedding_diagnostic = f"loaded via hub id {self.embedding_model_name}"
-
+            logger.info("🔄 Loading embedding model...")
+            self.embedding_model = SentenceTransformer(self.embedding_model_name)
             logger.info("✅ Embedding model loaded successfully")
         except Exception as e:
             logger.error(f"❌ Error loading embedding model: {e}")
             self.embedding_model = None
-            self.embedding_model_path = None
-            self.embedding_diagnostic = str(e)
-
+    
     def _load_tinyllama_model(self):
         """Load TinyLlama model for local inference (macOS compatible)"""
         try:
-            candidates = self._discover_llm_candidates()
-            if not candidates:
-                logger.warning("⚠️ TinyLlama-compatible model not found locally. Set LOCAL_LLM_PATH to override.")
-                self.llm_model_path = None
-                self.llm_diagnostic = "no local model detected"
+            # Find model path
+            possible_paths = [
+                self.models_dir / "quantized_tinyllama_health",
+                Path("../mobile_models/quantized_tinyllama_health"),
+                Path("../../agent/mobile_models/quantized_tinyllama_health"),
+                Path("mobile_models/quantized_tinyllama_health")
+            ]
+            
+            model_path = None
+            for path in possible_paths:
+                if path.exists():
+                    model_path = path
+                    break
+            
+            if model_path is None:
+                logger.warning("⚠️ TinyLlama model not found, using fallback responses")
                 return
-
-            model_path = candidates[0]
-            self.llm_model_path = model_path
-            self.llm_diagnostic = f"loading from {model_path}"
-
-            logger.info(f"🔄 Loading TinyLlama-compatible model from {model_path}...")
-
+            
+            logger.info("🔄 Loading TinyLlama model (macOS compatible)...")
+            
             # Load tokenizer
             self.llm_tokenizer = AutoTokenizer.from_pretrained(
                 str(model_path),
                 trust_remote_code=True
             )
-
+            
             # Load model without quantization for macOS compatibility
             self.llm_model = AutoModelForCausalLM.from_pretrained(
                 str(model_path),
@@ -330,17 +251,14 @@ class LocalHealthRAG:
             # Set pad token
             if self.llm_tokenizer.pad_token is None:
                 self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
-
+            
             logger.info("✅ TinyLlama model loaded successfully (CPU mode)")
-            self.llm_diagnostic = f"loaded from {model_path}"
-
+            
         except Exception as e:
             logger.warning(f"⚠️ TinyLlama model loading failed: {e}")
             logger.info("💡 Using rule-based responses instead of AI-generated text")
             self.llm_model = None
             self.llm_tokenizer = None
-            self.llm_model_path = None
-            self.llm_diagnostic = str(e)
     
     def _build_vector_index(self):
         """Build FAISS vector index from health guidelines"""
@@ -380,12 +298,10 @@ class LocalHealthRAG:
             self.doc_ids = doc_ids
             
             logger.info(f"✅ Vector index built with {len(documents)} documents")
-            self.vector_index_size = len(documents)
-
+            
         except Exception as e:
             logger.error(f"❌ Error building vector index: {e}")
             self.vector_index = None
-            self.vector_index_size = 0
     
     def _generate_response(self, prompt: str, max_length: int = 200) -> str:
         """Generate response using TinyLlama model"""
@@ -680,13 +596,8 @@ Response:"""
             "guidelines_loaded": len(self.guidelines),
             "emergency_protocols": len(self.emergency_protocols),
             "llm_model_loaded": self.llm_model is not None,
-            "llm_model_path": str(self.llm_model_path) if self.llm_model_path else None,
-            "llm_diagnostic": self.llm_diagnostic,
             "embedding_model_loaded": self.embedding_model is not None,
-            "embedding_model_path": str(self.embedding_model_path) if self.embedding_model_path else None,
-            "embedding_diagnostic": self.embedding_diagnostic,
             "vector_index_built": self.vector_index is not None,
-            "vector_index_size": self.vector_index_size,
             "rag_anything_available": self.rag_anything_client.is_available(),
             "rag_anything_url": self.rag_anything_client.base_url,
             "system_ready": True
