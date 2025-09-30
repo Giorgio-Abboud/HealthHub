@@ -7,7 +7,7 @@ import json
 import pickle
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Sequence
 import time
 import logging
 import torch
@@ -86,9 +86,9 @@ class RAGAnythingClient:
 
 class LocalHealthRAG:
     """Complete local RAG system with TinyLlama, embeddings, and vector search"""
-    
-    def __init__(self, 
-                 models_dir: str = "../mobile_models", 
+
+    def __init__(self,
+                 models_dir: str = "../mobile_models",
                  data_dir: str = "../../mobile_rag_ready",
                  embedding_model_name: str = "all-MiniLM-L6-v2",
                  rag_anything_url: str = "http://localhost:9999"):
@@ -101,8 +101,17 @@ class LocalHealthRAG:
             embedding_model_name: Sentence transformer model for embeddings
             rag_anything_url: URL of RAG-Anything server
         """
-        self.models_dir = Path(models_dir)
-        self.data_dir = Path(data_dir)
+        self._module_dir = Path(__file__).resolve().parent
+        self._repo_root = self._module_dir.parents[1]
+
+        self.models_dir = self._resolve_directory(models_dir, [
+            Path("agent") / "mobile_models",
+            Path("mobile_models"),
+        ])
+        self.data_dir = self._resolve_directory(data_dir, [
+            Path("mobile_rag_ready"),
+            Path("agent") / "mobile_rag_ready",
+        ])
         self.embedding_model_name = embedding_model_name
         
         # Initialize components
@@ -110,12 +119,16 @@ class LocalHealthRAG:
         self.llm_tokenizer = None
         self.embedding_model = None
         self.vector_index = None
-        self.guidelines = {}
-        self.emergency_protocols = {}
+        self.guidelines: Dict[str, Dict[str, Any]] = {}
+        self.emergency_protocols: Dict[str, Dict[str, Any]] = {}
+        self.doc_ids: List[str] = []
         
+        logger.info(f"📁 Models directory resolved to: {self.models_dir}")
+        logger.info(f"📂 Data directory resolved to: {self.data_dir}")
+
         # Initialize RAG-Anything client
         self.rag_anything_client = RAGAnythingClient(rag_anything_url)
-        
+
         # Load all components
         self._load_health_data()
         self._load_embedding_model()
@@ -129,7 +142,37 @@ class LocalHealthRAG:
         logger.info(f"🔍 Embedding Model: {'Loaded' if self.embedding_model is not None else 'Not Available'}")
         logger.info(f"📊 Vector Index: {'Built' if self.vector_index is not None else 'Not Available'}")
         logger.info(f"🌐 RAG-Anything Server: {'Connected' if self.rag_anything_client.is_available() else 'Not Available'}")
-    
+
+    def _resolve_directory(self, configured_path: str, fallback_subdirs: Sequence[Path]) -> Path:
+        """Resolve a directory by checking several repo-relative fallbacks."""
+        candidates: List[Path] = []
+
+        raw_path = Path(configured_path).expanduser()
+        if raw_path.is_absolute():
+            candidates.append(raw_path)
+        else:
+            candidates.extend([
+                (self._module_dir / raw_path).resolve(strict=False),
+                (self._repo_root / raw_path).resolve(strict=False),
+                (Path.cwd() / raw_path).resolve(strict=False),
+                raw_path.resolve(strict=False),
+            ])
+
+        for subdir in fallback_subdirs:
+            sub_candidate = (self._repo_root / subdir).resolve(strict=False)
+            if sub_candidate not in candidates:
+                candidates.append(sub_candidate)
+            alt = (self._module_dir / subdir).resolve(strict=False)
+            if alt not in candidates:
+                candidates.append(alt)
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        # Fall back to the first candidate even if it does not exist yet
+        return candidates[0] if candidates else self._repo_root
+
     def _load_health_data(self):
         """Load health guidelines and emergency protocols"""
         try:
