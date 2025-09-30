@@ -3,11 +3,13 @@
 # Frontend sends JSON: { session_id, envelope: { user, chat[] } }
 # Not medical advice. Prototype only.
 
-import os, json, re, time
-from typing import Dict, List, Literal, Optional
+import os, json, re, time, logging
+from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
 
 import numpy as np
+
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator  # Pydantic v2
@@ -20,10 +22,95 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 # ─────────────────────────────────────────
 from src.local_rag_system import LocalHealthRAG
 
+log = logging.getLogger(__name__)
+
 rag_system = LocalHealthRAG()
 status = rag_system.get_system_status()
+
+LLM_STARTUP_ERROR: Optional[str] = None
+LLM_DIAGNOSTICS: Dict[str, Any] = {}
+
+def _summarize_candidate_path(path: Path) -> Dict[str, Any]:
+    info: Dict[str, Any] = {"path": str(path), "exists": path.exists()}
+    if not path.exists():
+        return info
+
+    try:
+        config_path = path / "config.json"
+        tokenizer_path = path / "tokenizer.json"
+        safetensor_paths = list(path.glob("*.safetensors"))
+        if not safetensor_paths:
+            safetensor_paths = list(path.rglob("*.safetensors"))[:3]
+
+        safetensor_details: List[Dict[str, Any]] = []
+        total_size = 0
+        for st_path in safetensor_paths:
+            try:
+                size = st_path.stat().st_size
+            except OSError:
+                size = None
+            else:
+                total_size += size or 0
+            safetensor_details.append({
+                "name": st_path.name,
+                "size_bytes": size,
+            })
+
+        info.update({
+            "config_present": config_path.exists(),
+            "config_size_bytes": config_path.stat().st_size if config_path.exists() else None,
+            "tokenizer_present": tokenizer_path.exists(),
+            "tokenizer_size_bytes": tokenizer_path.stat().st_size if tokenizer_path.exists() else None,
+            "safetensor_files": safetensor_details,
+            "safetensor_total_bytes": total_size,
+        })
+
+        if config_path.exists():
+            try:
+                preview = config_path.read_text(encoding="utf-8", errors="ignore").strip()
+                info["config_preview"] = preview[:160]
+            except Exception as read_err:  # pragma: no cover - defensive logging only
+                info["config_preview_error"] = str(read_err)
+    except Exception as gather_err:  # pragma: no cover - defensive logging only
+        info["inspection_error"] = str(gather_err)
+
+    return info
+
 if not status.get("system_ready", False):
     raise RuntimeError("LocalHealthRAG system is not ready. Check your setup.")
+
+if not status.get("llm_model_loaded", False):
+    llm_error = status.get("llm_error")
+    candidate_fn = getattr(rag_system, "_discover_llm_candidates", None)
+    candidate_details: List[Dict[str, Any]] = []
+    if callable(candidate_fn):
+        for candidate_path in candidate_fn():
+            candidate_details.append(_summarize_candidate_path(Path(candidate_path)))
+
+    models_dir = getattr(rag_system, "models_dir", None)
+    if models_dir is not None:
+        models_dir_path = Path(models_dir)
+        if not any(detail.get("path") == str(models_dir_path) for detail in candidate_details):
+            candidate_details.append(_summarize_candidate_path(models_dir_path))
+
+    LLM_DIAGNOSTICS = {
+        "llm_error": llm_error or "TinyLlama model was not loaded.",
+        "llm_model_path": status.get("llm_model_path"),
+        "models_dir": str(models_dir) if models_dir is not None else None,
+        "candidate_paths": candidate_details,
+        "llm_candidate_errors": status.get("llm_candidate_errors", []),
+        "llm_weight_bytes": status.get("llm_weight_bytes"),
+    }
+
+    LLM_STARTUP_ERROR = (
+        "TinyLlama model failed to initialize; see diagnostics for details. "
+        "Verify that the TinyLlama directory contains a valid Hugging Face checkpoint "
+        "(config.json, tokenizer files, and *.safetensors weights)."
+    )
+
+    log.error("TinyLlama failed to load: %s", json.dumps(LLM_DIAGNOSTICS, indent=2))
+
+log.info("LocalHealthRAG component status: %s", json.dumps(status, indent=2))
 
 # Guard attributes used for dynamic vector updates
 if not hasattr(rag_system, "doc_ids"):
@@ -262,9 +349,28 @@ app = FastAPI()
 DEFAULT_HOST = os.getenv("PREDICTION_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("PREDICTION_PORT", os.getenv("PORT", "8000")))
 
+@app.get("/health")
+async def health() -> Dict[str, Any]:
+    """Expose LocalHealthRAG component diagnostics for troubleshooting."""
+    payload: Dict[str, Any] = {"status": rag_system.get_system_status(), "timestamp": time.time()}
+    if LLM_STARTUP_ERROR:
+        payload["llm_error"] = LLM_STARTUP_ERROR
+        payload["llm_diagnostics"] = LLM_DIAGNOSTICS
+    return payload
+
 @app.post("/chat")
 async def chat(req: ChatReq):
     session_id = req.session_id or "default"
+
+    if LLM_STARTUP_ERROR:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": LLM_STARTUP_ERROR,
+                "diagnostics": LLM_DIAGNOSTICS,
+            },
+        )
+
     # derive a simple user_id (slug) from name
     user_id = re.sub(r"[^a-z0-9_-]+", "-", req.envelope.user.name.strip().lower())
 
