@@ -18,7 +18,7 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 # ─────────────────────────────────────────
 # In-process RAG pipeline (your code)
 # ─────────────────────────────────────────
-from src.local_rag_system import LocalHealthRAG
+from .src.local_rag_system import LocalHealthRAG
 
 rag_system = LocalHealthRAG()
 status = rag_system.get_system_status()
