@@ -258,6 +258,10 @@ def _store_in_vector_db(session_id: str, envelope: ChatEnvelope) -> Optional[str
 # ─────────────────────────────────────────
 app = FastAPI()
 
+# Default host/port for manual execution (falls back to 0.0.0.0:8000)
+DEFAULT_HOST = os.getenv("PREDICTION_HOST", "0.0.0.0")
+DEFAULT_PORT = int(os.getenv("PREDICTION_PORT", os.getenv("PORT", "8000")))
+
 @app.post("/chat")
 async def chat(req: ChatReq):
     session_id = req.session_id or "default"
@@ -331,3 +335,10 @@ async def chat(req: ChatReq):
             "vector_document_id": stored_doc_id,
         }
     }
+
+
+if __name__ == "__main__":
+    # Convenience entry point so `python agent/prediction.py` listens on 0.0.0.0:8000
+    import uvicorn
+
+    uvicorn.run(app, host=DEFAULT_HOST, port=DEFAULT_PORT, log_level="info")
