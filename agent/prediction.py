@@ -20,7 +20,13 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 # ─────────────────────────────────────────
 # In-process RAG pipeline (your code)
 # ─────────────────────────────────────────
-from src.local_rag_system import LocalHealthRAG
+from .src.local_rag_system import LocalHealthRAG
+
+log = logging.getLogger(__name__)
+
+log = logging.getLogger(__name__)
+
+log = logging.getLogger(__name__)
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +57,7 @@ def _preview_small_file(path: Path, size: Optional[int]) -> Dict[str, Optional[s
     return {"preview": preview, "placeholder_hint": hint}
 
 
+
 def _summarize_candidate_path(path: Path) -> Dict[str, Any]:
     info: Dict[str, Any] = {"path": str(path), "exists": path.exists()}
     if not path.exists():
@@ -66,6 +73,7 @@ def _summarize_candidate_path(path: Path) -> Dict[str, Any]:
         safetensor_details: List[Dict[str, Any]] = []
         total_size = 0
         placeholder_hint: Optional[str] = None
+
         for st_path in safetensor_paths:
             try:
                 size = st_path.stat().st_size
@@ -87,6 +95,7 @@ def _summarize_candidate_path(path: Path) -> Dict[str, Any]:
                     placeholder_hint = preview_info["placeholder_hint"]
             safetensor_details.append(detail)
 
+
         info.update({
             "config_present": config_path.exists(),
             "config_size_bytes": config_path.stat().st_size if config_path.exists() else None,
@@ -95,6 +104,7 @@ def _summarize_candidate_path(path: Path) -> Dict[str, Any]:
             "safetensor_files": safetensor_details,
             "safetensor_total_bytes": total_size,
             "placeholder_hint": placeholder_hint,
+
         })
 
         if config_path.exists():
@@ -113,16 +123,19 @@ if not status.get("system_ready", False):
 
 llm_enabled = bool(status.get("llm_enabled", True))
 
+
 if not status.get("llm_model_loaded", False):
     llm_error = status.get("llm_error")
     candidate_fn = getattr(rag_system, "_discover_llm_candidates", None)
     candidate_details: List[Dict[str, Any]] = []
     if llm_enabled and callable(candidate_fn):
+
         for candidate_path in candidate_fn():
             candidate_details.append(_summarize_candidate_path(Path(candidate_path)))
 
     models_dir = getattr(rag_system, "models_dir", None)
     if models_dir is not None and llm_enabled:
+
         models_dir_path = Path(models_dir)
         if not any(detail.get("path") == str(models_dir_path) for detail in candidate_details):
             candidate_details.append(_summarize_candidate_path(models_dir_path))
@@ -131,6 +144,7 @@ if not status.get("llm_model_loaded", False):
         (detail.get("placeholder_hint") for detail in candidate_details if detail.get("placeholder_hint")),
         None,
     )
+
 
     LLM_DIAGNOSTICS = {
         "llm_error": llm_error or "TinyLlama model was not loaded.",
@@ -158,6 +172,7 @@ if not status.get("llm_model_loaded", False):
             LLM_STARTUP_ERROR = f"{LLM_STARTUP_ERROR} {placeholder_hint}"
 
     log.error("TinyLlama failed to load: %s", json.dumps(LLM_DIAGNOSTICS, indent=2))
+
 
 log.info("LocalHealthRAG component status: %s", json.dumps(status, indent=2))
 
@@ -406,6 +421,7 @@ async def health() -> Dict[str, Any]:
         payload["llm_error"] = LLM_STARTUP_ERROR
         payload["llm_diagnostics"] = LLM_DIAGNOSTICS
     return payload
+
 
 @app.post("/chat")
 async def chat(req: ChatReq):

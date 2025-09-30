@@ -147,6 +147,7 @@ class LocalHealthRAG:
         self.llm_weight_bytes: Optional[int] = None
         self.llm_placeholder_hint: Optional[str] = None
 
+
         self.embedding_model = None
         self.embedding_model_path: Optional[str] = None
         self.embedding_error: Optional[str] = None
@@ -374,6 +375,7 @@ class LocalHealthRAG:
         details = []
         total_size = 0
         placeholder_hint: Optional[str] = None
+
         for st_path in safetensor_files:
             try:
                 size = st_path.stat().st_size
@@ -407,6 +409,7 @@ class LocalHealthRAG:
                 "size_bytes": size,
                 "preview": preview,
                 "placeholder_hint": file_hint,
+
             })
 
         return {
@@ -419,6 +422,7 @@ class LocalHealthRAG:
         """Check configuration to decide if TinyLlama should be loaded."""
         raw = os.getenv("USE_TINYLLAMA", "0").strip().lower()
         return raw in {"1", "true", "yes", "on"}
+
 
     def _load_tinyllama_model(self):
         """Load TinyLlama model for local inference (macOS compatible)"""
@@ -443,6 +447,7 @@ class LocalHealthRAG:
             self.llm_weight_bytes = None
             self.llm_placeholder_hint = None
 
+
             for candidate in self._discover_llm_candidates():
                 try:
                     logger.info(f"🔍 Trying TinyLlama candidate: {candidate}")
@@ -450,6 +455,7 @@ class LocalHealthRAG:
                     total_bytes = st_stats.get("total_size_bytes", 0)
                     if total_bytes and total_bytes < 50 * 1024 * 1024:  # 50 MB threshold
                         hint = st_stats.get("placeholder_hint")
+
                         truncated_msg = (
                             f"weights appear truncated ({total_bytes} bytes). "
                             "Download the full TinyLlama checkpoint (~2 GB)."
@@ -486,6 +492,7 @@ class LocalHealthRAG:
                     self.llm_model_path = str(candidate)
                     self.llm_weight_bytes = total_bytes or None
                     self.llm_placeholder_hint = None
+
                     break
                 except Exception as candidate_error:  # pragma: no cover - logging only
                     errors.append(f"{candidate}: {candidate_error}")
@@ -498,6 +505,7 @@ class LocalHealthRAG:
                 if not self.llm_error:
                     self.llm_error = "TinyLlama checkpoint not found on disk"
                 self.llm_candidate_errors = errors
+
                 return
 
             # Set pad token
@@ -518,6 +526,7 @@ class LocalHealthRAG:
             self.llm_error = str(e)
             if errors:
                 self.llm_candidate_errors = errors
+
 
     def _build_vector_index(self):
         """Build FAISS vector index from health guidelines"""
@@ -899,6 +908,7 @@ Response:"""
             "llm_candidate_errors": self.llm_candidate_errors,
             "llm_weight_bytes": self.llm_weight_bytes,
             "llm_placeholder_hint": self.llm_placeholder_hint,
+
             "embedding_model_loaded": self.embedding_model is not None,
             "embedding_model_path": self.embedding_model_path,
             "embedding_error": self.embedding_error,
