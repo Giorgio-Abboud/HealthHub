@@ -25,6 +25,7 @@ class RAGAnythingClient:
     def __init__(self, base_url: str = "http://localhost:9999"):
         self.base_url = base_url.rstrip("/")
         self.available = False
+        self._last_error: Optional[str] = None
         self._test_connection()
     
     def _test_connection(self):
@@ -33,12 +34,23 @@ class RAGAnythingClient:
             resp = requests.get(f"{self.base_url}/health", timeout=5)
             if resp.status_code == 200:
                 self.available = True
+                self._last_error = None
                 logger.info("✅ RAG-Anything server connected")
             else:
-                logger.warning("⚠️ RAG-Anything server responded with non-200 status")
+                self._last_error = f"healthcheck status {resp.status_code}"
+                logger.info(
+                    "ℹ️ RAG-Anything server not ready (optional integration disabled: %s)",
+                    self._last_error,
+                )
         except Exception as e:
-            logger.warning(f"⚠️ RAG-Anything server unavailable: {e}")
+            # Network hiccups here should not be alarming to end users running the
+            # local experience without the optional RAG-Anything process.
+            self._last_error = str(e)
             self.available = False
+            logger.info(
+                "ℹ️ RAG-Anything server unavailable (optional integration disabled): %s",
+                self._last_error,
+            )
     
     def retrieve(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         """
@@ -83,6 +95,11 @@ class RAGAnythingClient:
     def is_available(self) -> bool:
         """Check if RAG-Anything server is available"""
         return self.available
+
+    @property
+    def last_error(self) -> Optional[str]:
+        """Last recorded connection error message (if any)."""
+        return self._last_error
 
 class LocalHealthRAG:
     """Complete local RAG system with TinyLlama, embeddings, and vector search"""
@@ -141,7 +158,10 @@ class LocalHealthRAG:
         logger.info(f"🤖 TinyLlama Model: {'Loaded' if self.llm_model is not None else 'Not Available'}")
         logger.info(f"🔍 Embedding Model: {'Loaded' if self.embedding_model is not None else 'Not Available'}")
         logger.info(f"📊 Vector Index: {'Built' if self.vector_index is not None else 'Not Available'}")
-        logger.info(f"🌐 RAG-Anything Server: {'Connected' if self.rag_anything_client.is_available() else 'Not Available'}")
+        rag_anything_status = "Connected" if self.rag_anything_client.is_available() else "Not Available"
+        if not self.rag_anything_client.is_available() and self.rag_anything_client.last_error:
+            rag_anything_status += f" (reason: {self.rag_anything_client.last_error})"
+        logger.info(f"🌐 RAG-Anything Server: {rag_anything_status}")
 
     def _resolve_directory(self, configured_path: str, fallback_subdirs: Sequence[Path]) -> Path:
         """Resolve a directory by checking several repo-relative fallbacks."""
@@ -348,10 +368,10 @@ class LocalHealthRAG:
                     errors.append(f"{candidate}: {candidate_error}")
 
             if model_path is None:
-                logger.warning("⚠️ TinyLlama model not found, using fallback responses")
+                logger.info("ℹ️ TinyLlama model not found locally; falling back to rule-based responses")
                 if errors:
                     for err in errors:
-                        logger.warning(f"⚠️ Candidate TinyLlama load failed: {err}")
+                        logger.debug(f"TinyLlama candidate skipped: {err}")
                 return
 
             # Set pad token
@@ -364,8 +384,7 @@ class LocalHealthRAG:
             logger.info(f"✅ TinyLlama model loaded successfully from {model_path} (CPU mode)")
             
         except Exception as e:
-            logger.warning(f"⚠️ TinyLlama model loading failed: {e}")
-            logger.info("💡 Using rule-based responses instead of AI-generated text")
+            logger.info("ℹ️ TinyLlama model loading failed; using rule-based responses instead: %s", e)
             self.llm_model = None
             self.llm_tokenizer = None
     
