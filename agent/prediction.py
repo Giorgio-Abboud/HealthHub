@@ -3,8 +3,8 @@
 # Frontend sends JSON: { session_id, envelope: { user, chat[] } }
 # Not medical advice. Prototype only.
 
-import os, json, re, time
-from typing import Dict, List, Literal, Optional
+import os, json, re, time, logging
+from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
 
 import numpy as np
@@ -20,10 +20,14 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 # ─────────────────────────────────────────
 from src.local_rag_system import LocalHealthRAG
 
+log = logging.getLogger(__name__)
+
 rag_system = LocalHealthRAG()
 status = rag_system.get_system_status()
 if not status.get("system_ready", False):
     raise RuntimeError("LocalHealthRAG system is not ready. Check your setup.")
+
+log.info("LocalHealthRAG component status: %s", json.dumps(status, indent=2))
 
 # Guard attributes used for dynamic vector updates
 if not hasattr(rag_system, "doc_ids"):
@@ -261,6 +265,11 @@ app = FastAPI()
 # Default host/port for manual execution (falls back to 0.0.0.0:8000)
 DEFAULT_HOST = os.getenv("PREDICTION_HOST", "0.0.0.0")
 DEFAULT_PORT = int(os.getenv("PREDICTION_PORT", os.getenv("PORT", "8000")))
+
+@app.get("/health")
+async def health() -> Dict[str, Any]:
+    """Expose LocalHealthRAG component diagnostics for troubleshooting."""
+    return {"status": rag_system.get_system_status(), "timestamp": time.time()}
 
 @app.post("/chat")
 async def chat(req: ChatReq):
