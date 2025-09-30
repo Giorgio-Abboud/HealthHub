@@ -13,9 +13,15 @@ import logging
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from sentence_transformers import SentenceTransformer
-import faiss
 import os
 import requests
+
+try:  # pragma: no cover - optional dependency on some platforms
+    import faiss  # type: ignore
+    _FAISS_AVAILABLE = True
+except ImportError:  # pragma: no cover - handled gracefully in code
+    faiss = None  # type: ignore
+    _FAISS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +31,7 @@ class RAGAnythingClient:
     def __init__(self, base_url: str = "http://localhost:9999"):
         self.base_url = base_url.rstrip("/")
         self.available = False
+        self._last_error: Optional[str] = None
         self._test_connection()
     
     def _test_connection(self):
@@ -33,12 +40,23 @@ class RAGAnythingClient:
             resp = requests.get(f"{self.base_url}/health", timeout=5)
             if resp.status_code == 200:
                 self.available = True
+                self._last_error = None
                 logger.info("✅ RAG-Anything server connected")
             else:
-                logger.warning("⚠️ RAG-Anything server responded with non-200 status")
+                self._last_error = f"healthcheck status {resp.status_code}"
+                logger.info(
+                    "ℹ️ RAG-Anything server not ready (optional integration disabled: %s)",
+                    self._last_error,
+                )
         except Exception as e:
-            logger.warning(f"⚠️ RAG-Anything server unavailable: {e}")
+            # Network hiccups here should not be alarming to end users running the
+            # local experience without the optional RAG-Anything process.
+            self._last_error = str(e)
             self.available = False
+            logger.info(
+                "ℹ️ RAG-Anything server unavailable (optional integration disabled): %s",
+                self._last_error,
+            )
     
     def retrieve(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         """
@@ -84,6 +102,11 @@ class RAGAnythingClient:
         """Check if RAG-Anything server is available"""
         return self.available
 
+    @property
+    def last_error(self) -> Optional[str]:
+        """Last recorded connection error message (if any)."""
+        return self._last_error
+
 class LocalHealthRAG:
     """Complete local RAG system with TinyLlama, embeddings, and vector search"""
 
@@ -117,8 +140,16 @@ class LocalHealthRAG:
         # Initialize components
         self.llm_model = None
         self.llm_tokenizer = None
+        self.llm_model_path: Optional[str] = None
+        self.llm_error: Optional[str] = None
+
         self.embedding_model = None
+        self.embedding_model_path: Optional[str] = None
+        self.embedding_error: Optional[str] = None
+
         self.vector_index = None
+        self.vector_index_error: Optional[str] = None
+        self._faiss_available = _FAISS_AVAILABLE
         self.guidelines: Dict[str, Dict[str, Any]] = {}
         self.emergency_protocols: Dict[str, Dict[str, Any]] = {}
         self.doc_ids: List[str] = []
@@ -141,7 +172,10 @@ class LocalHealthRAG:
         logger.info(f"🤖 TinyLlama Model: {'Loaded' if self.llm_model is not None else 'Not Available'}")
         logger.info(f"🔍 Embedding Model: {'Loaded' if self.embedding_model is not None else 'Not Available'}")
         logger.info(f"📊 Vector Index: {'Built' if self.vector_index is not None else 'Not Available'}")
-        logger.info(f"🌐 RAG-Anything Server: {'Connected' if self.rag_anything_client.is_available() else 'Not Available'}")
+        rag_anything_status = "Connected" if self.rag_anything_client.is_available() else "Not Available"
+        if not self.rag_anything_client.is_available() and self.rag_anything_client.last_error:
+            rag_anything_status += f" (reason: {self.rag_anything_client.last_error})"
+        logger.info(f"🌐 RAG-Anything Server: {rag_anything_status}")
 
     def _resolve_directory(self, configured_path: str, fallback_subdirs: Sequence[Path]) -> Path:
         """Resolve a directory by checking several repo-relative fallbacks."""
@@ -251,6 +285,8 @@ class LocalHealthRAG:
             return False
         config_exists = (path / "config.json").exists()
         safetensor_exists = any(path.glob("*.safetensors"))
+        if not safetensor_exists:
+            safetensor_exists = any(path.rglob("*.safetensors"))
         tokenizer_exists = any((path / name).exists() for name in [
             "tokenizer.json",
             "tokenizer_config.json",
@@ -265,6 +301,8 @@ class LocalHealthRAG:
             return False
         config_exists = (path / "config.json").exists() or (path / "config_sentence_transformers.json").exists()
         safetensor_exists = any(path.glob("*.safetensors"))
+        if not safetensor_exists:
+            safetensor_exists = any(path.rglob("*.safetensors"))
         modules_file = (path / "modules.json").exists()
         return config_exists and safetensor_exists and modules_file
 
@@ -297,11 +335,15 @@ class LocalHealthRAG:
         try:
             logger.info("🔄 Loading embedding model...")
 
+            self.embedding_error = None
+            self.embedding_model_path = None
+
             errors: List[str] = []
             for candidate in self._discover_embedding_candidates():
                 try:
                     self.embedding_model = SentenceTransformer(str(candidate))
                     logger.info(f"✅ Embedding model loaded from {candidate}")
+                    self.embedding_model_path = str(candidate)
                     return
                 except Exception as candidate_error:  # pragma: no cover - logging only
                     errors.append(f"{candidate}: {candidate_error}")
@@ -309,6 +351,7 @@ class LocalHealthRAG:
             # Fall back to the configured name (may be a Hugging Face identifier or absolute path)
             self.embedding_model = SentenceTransformer(self.embedding_model_name)
             logger.info(f"✅ Embedding model loaded using identifier '{self.embedding_model_name}'")
+            self.embedding_model_path = self.embedding_model_name
 
         except Exception as e:
             if errors:
@@ -316,13 +359,17 @@ class LocalHealthRAG:
                     logger.warning(f"⚠️ Candidate embedding load failed: {err}")
             logger.error(f"❌ Error loading embedding model: {e}")
             self.embedding_model = None
-    
+            self.embedding_error = str(e)
+
     def _load_tinyllama_model(self):
         """Load TinyLlama model for local inference (macOS compatible)"""
         try:
             # Find model path
             model_path = None
             errors: List[str] = []
+
+            self.llm_error = None
+            self.llm_model_path = None
 
             for candidate in self._discover_llm_candidates():
                 try:
@@ -343,15 +390,17 @@ class LocalHealthRAG:
                     model_path = candidate
                     self.llm_tokenizer = tokenizer
                     self.llm_model = model
+                    self.llm_model_path = str(candidate)
                     break
                 except Exception as candidate_error:  # pragma: no cover - logging only
                     errors.append(f"{candidate}: {candidate_error}")
 
             if model_path is None:
-                logger.warning("⚠️ TinyLlama model not found, using fallback responses")
+                logger.info("ℹ️ TinyLlama model not found locally; falling back to rule-based responses")
                 if errors:
                     for err in errors:
-                        logger.warning(f"⚠️ Candidate TinyLlama load failed: {err}")
+                        logger.debug(f"TinyLlama candidate skipped: {err}")
+                self.llm_error = "TinyLlama checkpoint not found on disk"
                 return
 
             # Set pad token
@@ -364,20 +413,29 @@ class LocalHealthRAG:
             logger.info(f"✅ TinyLlama model loaded successfully from {model_path} (CPU mode)")
             
         except Exception as e:
-            logger.warning(f"⚠️ TinyLlama model loading failed: {e}")
-            logger.info("💡 Using rule-based responses instead of AI-generated text")
+            logger.info("ℹ️ TinyLlama model loading failed; using rule-based responses instead: %s", e)
             self.llm_model = None
             self.llm_tokenizer = None
-    
+            self.llm_error = str(e)
+
     def _build_vector_index(self):
         """Build FAISS vector index from health guidelines"""
         try:
+            if not self._faiss_available:
+                self.vector_index_error = "faiss library not available"
+                logger.warning("⚠️ Cannot build vector index: faiss library is not installed")
+                return
+
             if not self.embedding_model or not self.guidelines:
                 logger.warning("⚠️ Cannot build vector index: missing embedding model or guidelines")
+                if not self.embedding_model and not self.embedding_error:
+                    self.vector_index_error = "embedding model unavailable"
+                elif not self.guidelines:
+                    self.vector_index_error = "no guidelines loaded"
                 return
-            
+
             logger.info("🔄 Building vector index...")
-            
+
             # Prepare documents
             documents = []
             doc_ids = []
@@ -390,8 +448,9 @@ class LocalHealthRAG:
             
             if not documents:
                 logger.warning("⚠️ No documents to index")
+                self.vector_index_error = "no documents available for indexing"
                 return
-            
+
             # Generate embeddings
             embeddings = self.embedding_model.encode(documents)
             
@@ -405,12 +464,14 @@ class LocalHealthRAG:
             
             # Store document IDs
             self.doc_ids = doc_ids
-            
+
             logger.info(f"✅ Vector index built with {len(documents)} documents")
-            
+            self.vector_index_error = None
+
         except Exception as e:
             logger.error(f"❌ Error building vector index: {e}")
             self.vector_index = None
+            self.vector_index_error = str(e)
     
     def _generate_response(self, prompt: str, max_length: int = 200) -> str:
         """Generate response using TinyLlama model"""
@@ -705,10 +766,17 @@ Response:"""
             "guidelines_loaded": len(self.guidelines),
             "emergency_protocols": len(self.emergency_protocols),
             "llm_model_loaded": self.llm_model is not None,
+            "llm_model_path": self.llm_model_path,
+            "llm_error": self.llm_error,
             "embedding_model_loaded": self.embedding_model is not None,
+            "embedding_model_path": self.embedding_model_path,
+            "embedding_error": self.embedding_error,
             "vector_index_built": self.vector_index is not None,
+            "vector_index_error": self.vector_index_error,
+            "faiss_available": self._faiss_available,
             "rag_anything_available": self.rag_anything_client.is_available(),
             "rag_anything_url": self.rag_anything_client.base_url,
+            "rag_anything_error": self.rag_anything_client.last_error,
             "system_ready": True
         }
 
