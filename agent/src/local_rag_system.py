@@ -13,11 +13,20 @@ import logging
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from sentence_transformers import SentenceTransformer
-import faiss
 import os
 import requests
 
+try:  # pragma: no cover - optional dependency on some platforms
+    import faiss  # type: ignore
+    _FAISS_AVAILABLE = True
+except ImportError:  # pragma: no cover - handled gracefully in code
+    faiss = None  # type: ignore
+    _FAISS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
+
+DEFAULT_TINYLLAMA_REPO_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+DEFAULT_MIN_TINYLLAMA_WEIGHT_BYTES = 500 * 1024 * 1024  # 500 MB safety floor
 
 class RAGAnythingClient:
     """RAG-Anything server client for retrieving additional context"""
@@ -25,6 +34,7 @@ class RAGAnythingClient:
     def __init__(self, base_url: str = "http://localhost:9999"):
         self.base_url = base_url.rstrip("/")
         self.available = False
+        self._last_error: Optional[str] = None
         self._test_connection()
     
     def _test_connection(self):
@@ -33,12 +43,23 @@ class RAGAnythingClient:
             resp = requests.get(f"{self.base_url}/health", timeout=5)
             if resp.status_code == 200:
                 self.available = True
+                self._last_error = None
                 logger.info("✅ RAG-Anything server connected")
             else:
-                logger.warning("⚠️ RAG-Anything server responded with non-200 status")
+                self._last_error = f"healthcheck status {resp.status_code}"
+                logger.info(
+                    "ℹ️ RAG-Anything server not ready (optional integration disabled: %s)",
+                    self._last_error,
+                )
         except Exception as e:
-            logger.warning(f"⚠️ RAG-Anything server unavailable: {e}")
+            # Network hiccups here should not be alarming to end users running the
+            # local experience without the optional RAG-Anything process.
+            self._last_error = str(e)
             self.available = False
+            logger.info(
+                "ℹ️ RAG-Anything server unavailable (optional integration disabled): %s",
+                self._last_error,
+            )
     
     def retrieve(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         """
@@ -84,6 +105,11 @@ class RAGAnythingClient:
         """Check if RAG-Anything server is available"""
         return self.available
 
+    @property
+    def last_error(self) -> Optional[str]:
+        """Last recorded connection error message (if any)."""
+        return self._last_error
+
 class LocalHealthRAG:
     """Complete local RAG system with TinyLlama, embeddings, and vector search"""
 
@@ -113,12 +139,40 @@ class LocalHealthRAG:
             Path("agent") / "mobile_rag_ready",
         ])
         self.embedding_model_name = embedding_model_name
+        self.use_tinyllama = self._should_enable_tinyllama()
         
         # Initialize components
         self.llm_model = None
         self.llm_tokenizer = None
+        self.llm_model_path: Optional[str] = None
+        self.llm_error: Optional[str] = None
+        self.llm_candidate_errors: List[str] = []
+        self.llm_weight_bytes: Optional[int] = None
+        self.llm_placeholder_hint: Optional[str] = None
+        self.llm_auto_download_attempted: bool = False
+        self.llm_auto_download_succeeded: bool = False
+        self.llm_auto_download_error: Optional[str] = None
+
+        self.tinyllama_repo_id = os.getenv("TINYLLAMA_REPO_ID", DEFAULT_TINYLLAMA_REPO_ID)
+        try:
+            self.min_tinyllama_weight_bytes = int(
+                os.getenv(
+                    "MIN_TINYLLAMA_WEIGHT_BYTES",
+                    str(DEFAULT_MIN_TINYLLAMA_WEIGHT_BYTES),
+                )
+            )
+        except ValueError:
+            self.min_tinyllama_weight_bytes = DEFAULT_MIN_TINYLLAMA_WEIGHT_BYTES
+        auto_download_raw = os.getenv("AUTO_DOWNLOAD_TINYLLAMA", "1").strip().lower()
+        self.auto_download_tinyllama = auto_download_raw not in {"0", "false", "no", "off"}
+
         self.embedding_model = None
+        self.embedding_model_path: Optional[str] = None
+        self.embedding_error: Optional[str] = None
+
         self.vector_index = None
+        self.vector_index_error: Optional[str] = None
+        self._faiss_available = _FAISS_AVAILABLE
         self.guidelines: Dict[str, Dict[str, Any]] = {}
         self.emergency_protocols: Dict[str, Dict[str, Any]] = {}
         self.doc_ids: List[str] = []
@@ -141,7 +195,10 @@ class LocalHealthRAG:
         logger.info(f"🤖 TinyLlama Model: {'Loaded' if self.llm_model is not None else 'Not Available'}")
         logger.info(f"🔍 Embedding Model: {'Loaded' if self.embedding_model is not None else 'Not Available'}")
         logger.info(f"📊 Vector Index: {'Built' if self.vector_index is not None else 'Not Available'}")
-        logger.info(f"🌐 RAG-Anything Server: {'Connected' if self.rag_anything_client.is_available() else 'Not Available'}")
+        rag_anything_status = "Connected" if self.rag_anything_client.is_available() else "Not Available"
+        if not self.rag_anything_client.is_available() and self.rag_anything_client.last_error:
+            rag_anything_status += f" (reason: {self.rag_anything_client.last_error})"
+        logger.info(f"🌐 RAG-Anything Server: {rag_anything_status}")
 
     def _resolve_directory(self, configured_path: str, fallback_subdirs: Sequence[Path]) -> Path:
         """Resolve a directory by checking several repo-relative fallbacks."""
@@ -192,6 +249,8 @@ class LocalHealthRAG:
         candidates: List[Path] = []
         seen: Set[Path] = set()
 
+        incomplete: List[Path] = []
+
         for root in search_roots:
             root = root.resolve(strict=False)
             if not root.exists():
@@ -199,15 +258,22 @@ class LocalHealthRAG:
             for subdir in preferred_subdirs:
                 candidate = (root / subdir).resolve(strict=False)
                 if candidate.exists() and candidate not in seen:
+                    seen.add(candidate)
                     if self._looks_like_llm_dir(candidate):
                         candidates.append(candidate)
-                        seen.add(candidate)
+                    else:
+                        incomplete.append(candidate)
 
         # Also include the models_dir itself if it contains a checkpoint directly
-        if self._looks_like_llm_dir(self.models_dir) and self.models_dir not in seen:
-            candidates.append(self.models_dir)
+        models_dir = self.models_dir.resolve(strict=False)
+        if models_dir.exists() and models_dir not in seen:
+            seen.add(models_dir)
+            if self._looks_like_llm_dir(models_dir):
+                candidates.append(models_dir)
+            else:
+                incomplete.append(models_dir)
 
-        return candidates
+        return candidates + incomplete
 
     def _discover_embedding_candidates(self) -> List[Path]:
         """Return possible on-disk locations that may host a MiniLM checkpoint."""
@@ -251,6 +317,8 @@ class LocalHealthRAG:
             return False
         config_exists = (path / "config.json").exists()
         safetensor_exists = any(path.glob("*.safetensors"))
+        if not safetensor_exists:
+            safetensor_exists = any(path.rglob("*.safetensors"))
         tokenizer_exists = any((path / name).exists() for name in [
             "tokenizer.json",
             "tokenizer_config.json",
@@ -265,6 +333,8 @@ class LocalHealthRAG:
             return False
         config_exists = (path / "config.json").exists() or (path / "config_sentence_transformers.json").exists()
         safetensor_exists = any(path.glob("*.safetensors"))
+        if not safetensor_exists:
+            safetensor_exists = any(path.rglob("*.safetensors"))
         modules_file = (path / "modules.json").exists()
         return config_exists and safetensor_exists and modules_file
 
@@ -297,11 +367,15 @@ class LocalHealthRAG:
         try:
             logger.info("🔄 Loading embedding model...")
 
+            self.embedding_error = None
+            self.embedding_model_path = None
+
             errors: List[str] = []
             for candidate in self._discover_embedding_candidates():
                 try:
                     self.embedding_model = SentenceTransformer(str(candidate))
                     logger.info(f"✅ Embedding model loaded from {candidate}")
+                    self.embedding_model_path = str(candidate)
                     return
                 except Exception as candidate_error:  # pragma: no cover - logging only
                     errors.append(f"{candidate}: {candidate_error}")
@@ -309,6 +383,7 @@ class LocalHealthRAG:
             # Fall back to the configured name (may be a Hugging Face identifier or absolute path)
             self.embedding_model = SentenceTransformer(self.embedding_model_name)
             logger.info(f"✅ Embedding model loaded using identifier '{self.embedding_model_name}'")
+            self.embedding_model_path = self.embedding_model_name
 
         except Exception as e:
             if errors:
@@ -316,17 +391,241 @@ class LocalHealthRAG:
                     logger.warning(f"⚠️ Candidate embedding load failed: {err}")
             logger.error(f"❌ Error loading embedding model: {e}")
             self.embedding_model = None
-    
+            self.embedding_error = str(e)
+
+    def _auto_repair_tinyllama(self) -> None:
+        """Attempt to download or refresh TinyLlama weights automatically."""
+
+        self.llm_auto_download_error = None
+        self.llm_auto_download_succeeded = False
+        self.llm_auto_download_attempted = False
+
+        if not self.auto_download_tinyllama:
+            return
+
+        min_bytes = max(self.min_tinyllama_weight_bytes, 50 * 1024 * 1024)
+        candidates = [path.resolve(strict=False) for path in self._discover_llm_candidates()]
+        if not candidates:
+            fallback_root = self.models_dir.resolve(strict=False)
+            candidates = [
+                (fallback_root / "TinyLlama-1.1B-Chat-v1.0").resolve(strict=False),
+                (fallback_root / "quantized_tinyllama_health").resolve(strict=False),
+            ]
+
+        unique_candidates: List[Path] = []
+        seen: Set[Path] = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            unique_candidates.append(candidate)
+        candidates = unique_candidates
+
+        attempted = False
+        errors: List[str] = []
+        success_target: Optional[Path] = None
+
+        for candidate in candidates:
+            stats = self._collect_safetensor_stats(candidate)
+            total_bytes = stats.get("total_size_bytes") or 0
+            has_files = bool(stats.get("files"))
+            if has_files and total_bytes >= min_bytes:
+                continue
+
+            attempted = True
+            try:
+                self._download_tinyllama(candidate, force=has_files or total_bytes > 0)
+            except Exception as err:  # pragma: no cover - network/IO heavy
+                errors.append(f"{candidate}: {err}")
+                continue
+
+            refreshed_stats = self._collect_safetensor_stats(candidate)
+            refreshed_total = refreshed_stats.get("total_size_bytes") or 0
+            refreshed_has_files = bool(refreshed_stats.get("files"))
+            if refreshed_has_files and refreshed_total >= min_bytes:
+                success_target = candidate
+                self.llm_auto_download_succeeded = True
+                break
+
+            errors.append(
+                f"{candidate}: download completed but only {refreshed_total} bytes present (expected ≥ {min_bytes})"
+            )
+
+        if attempted:
+            self.llm_auto_download_attempted = True
+            if self.llm_auto_download_succeeded and success_target is not None:
+                logger.info(
+                    "⬇️ TinyLlama checkpoint downloaded automatically to %s", success_target
+                )
+            elif errors:
+                self.llm_auto_download_error = "; ".join(errors)
+                logger.warning(
+                    "⚠️ Automatic TinyLlama repair failed: %s", self.llm_auto_download_error
+                )
+
+    def _download_tinyllama(self, target_dir: Path, *, force: bool) -> None:
+        """Download TinyLlama weights into ``target_dir`` using huggingface_hub."""
+
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "huggingface_hub is required for automatic TinyLlama downloads. "
+                "Install it with `pip install huggingface_hub`."
+            ) from exc
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Clean up obvious pointer files when forcing a refresh
+        if force and target_dir.exists():
+            for pointer in list(target_dir.glob("*.safetensors")):
+                try:
+                    pointer.unlink()
+                except OSError:
+                    continue
+
+        logger.info(
+            "⬇️ Attempting automatic TinyLlama download (%s → %s)",
+            self.tinyllama_repo_id,
+            target_dir,
+        )
+
+        snapshot_download(
+            repo_id=self.tinyllama_repo_id,
+            local_dir=str(target_dir),
+            local_dir_use_symlinks=False,
+            resume_download=True,
+            force_download=force,
+        )
+
+    def _collect_safetensor_stats(self, candidate: Path) -> Dict[str, Any]:
+        """Return safetensor metadata (path + size) for diagnostics."""
+        safetensor_files = list(candidate.glob("*.safetensors"))
+        if not safetensor_files:
+            safetensor_files = list(candidate.rglob("*.safetensors"))
+
+        details = []
+        total_size = 0
+        placeholder_hint: Optional[str] = None
+        for st_path in safetensor_files:
+            try:
+                size = st_path.stat().st_size
+            except OSError:
+                size = 0
+            total_size += size
+
+            preview: Optional[str] = None
+            file_hint: Optional[str] = None
+            if size <= 2048:
+                try:
+                    raw = st_path.read_bytes()
+                except OSError:
+                    preview = None
+                else:
+                    text_preview = raw[:1024].decode("utf-8", errors="ignore").strip()
+                    preview = text_preview[:200]
+                    if "git-lfs" in text_preview:
+                        file_hint = (
+                            "File appears to be a Git LFS pointer. Install Git LFS and run "
+                            "`git lfs install` followed by `git lfs pull` to download the real weights."
+                        )
+                    elif size == 0:
+                        file_hint = "Empty safetensor file found. Re-download the checkpoint."
+
+            if file_hint and not placeholder_hint:
+                placeholder_hint = file_hint
+
+            details.append({
+                "path": str(st_path),
+                "size_bytes": size,
+                "preview": preview,
+                "placeholder_hint": file_hint,
+            })
+
+        if not details:
+            placeholder_hint = (
+                "No TinyLlama weights (.safetensors) found in this folder. "
+                "Run `python scripts/ensure_models.py` to download the checkpoint."
+            )
+
+        return {
+            "files": details,
+            "total_size_bytes": total_size,
+            "placeholder_hint": placeholder_hint,
+        }
+
+    def _should_enable_tinyllama(self) -> bool:
+        """Check configuration to decide if TinyLlama should be loaded."""
+        raw = os.getenv("USE_TINYLLAMA", "0").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
     def _load_tinyllama_model(self):
         """Load TinyLlama model for local inference (macOS compatible)"""
+        if not self.use_tinyllama:
+            self.llm_error = "TinyLlama loading disabled (set USE_TINYLLAMA=1 to enable)."
+            self.llm_candidate_errors = []
+            self.llm_weight_bytes = None
+            self.llm_placeholder_hint = None
+            logger.info(
+                "⏭️  Skipping TinyLlama load because USE_TINYLLAMA is not enabled."
+            )
+            return
+
         try:
             # Find model path
             model_path = None
             errors: List[str] = []
 
+            self._auto_repair_tinyllama()
+
+            self.llm_error = None
+            self.llm_model_path = None
+            self.llm_candidate_errors = []
+            self.llm_weight_bytes = None
+            self.llm_placeholder_hint = None
+
             for candidate in self._discover_llm_candidates():
                 try:
                     logger.info(f"🔍 Trying TinyLlama candidate: {candidate}")
+                    st_stats = self._collect_safetensor_stats(candidate)
+                    total_bytes = st_stats.get("total_size_bytes", 0)
+                    safetensor_files = st_stats.get("files", [])
+                    if not safetensor_files:
+                        hint = st_stats.get("placeholder_hint")
+                        missing_msg = (
+                            "No TinyLlama weights (.safetensors) were found in this directory. "
+                            "Run `python scripts/ensure_models.py` to download the checkpoint."
+                        )
+                        if hint:
+                            missing_msg = f"{missing_msg} {hint}"
+                            self.llm_placeholder_hint = hint
+                        logger.warning(
+                            "⚠️ TinyLlama candidate missing weights: %s", candidate
+                        )
+                        errors.append(f"{candidate}: {missing_msg}")
+                        if not self.llm_error:
+                            self.llm_error = missing_msg
+                        continue
+                    min_bytes = max(self.min_tinyllama_weight_bytes, 50 * 1024 * 1024)
+                    if total_bytes and total_bytes < min_bytes:
+                        hint = st_stats.get("placeholder_hint")
+                        truncated_msg = (
+                            f"weights appear truncated ({total_bytes} bytes). "
+                            f"Download the full TinyLlama checkpoint (expected ≥ {min_bytes} bytes)."
+                        )
+                        if hint:
+                            truncated_msg = f"{truncated_msg} {hint}"
+                            self.llm_placeholder_hint = hint
+                        logger.warning(
+                            "⚠️ TinyLlama candidate rejected due to insufficient weight size: %s (%s)",
+                            candidate,
+                            truncated_msg,
+                        )
+                        errors.append(f"{candidate}: {truncated_msg}")
+                        if not self.llm_error:
+                            self.llm_error = truncated_msg
+                        continue
+
                     tokenizer = AutoTokenizer.from_pretrained(
                         str(candidate),
                         trust_remote_code=True
@@ -343,15 +642,21 @@ class LocalHealthRAG:
                     model_path = candidate
                     self.llm_tokenizer = tokenizer
                     self.llm_model = model
+                    self.llm_model_path = str(candidate)
+                    self.llm_weight_bytes = total_bytes or None
+                    self.llm_placeholder_hint = None
                     break
                 except Exception as candidate_error:  # pragma: no cover - logging only
                     errors.append(f"{candidate}: {candidate_error}")
 
             if model_path is None:
-                logger.warning("⚠️ TinyLlama model not found, using fallback responses")
+                logger.info("ℹ️ TinyLlama model not found locally; falling back to rule-based responses")
                 if errors:
                     for err in errors:
-                        logger.warning(f"⚠️ Candidate TinyLlama load failed: {err}")
+                        logger.debug(f"TinyLlama candidate skipped: {err}")
+                if not self.llm_error:
+                    self.llm_error = "TinyLlama checkpoint not found on disk"
+                self.llm_candidate_errors = errors
                 return
 
             # Set pad token
@@ -362,22 +667,35 @@ class LocalHealthRAG:
                 self.llm_model.to(torch.device("cpu"))
 
             logger.info(f"✅ TinyLlama model loaded successfully from {model_path} (CPU mode)")
-            
+            if errors:
+                self.llm_candidate_errors = errors
+
         except Exception as e:
-            logger.warning(f"⚠️ TinyLlama model loading failed: {e}")
-            logger.info("💡 Using rule-based responses instead of AI-generated text")
+            logger.info("ℹ️ TinyLlama model loading failed; using rule-based responses instead: %s", e)
             self.llm_model = None
             self.llm_tokenizer = None
-    
+            self.llm_error = str(e)
+            if errors:
+                self.llm_candidate_errors = errors
+
     def _build_vector_index(self):
         """Build FAISS vector index from health guidelines"""
         try:
+            if not self._faiss_available:
+                self.vector_index_error = "faiss library not available"
+                logger.warning("⚠️ Cannot build vector index: faiss library is not installed")
+                return
+
             if not self.embedding_model or not self.guidelines:
                 logger.warning("⚠️ Cannot build vector index: missing embedding model or guidelines")
+                if not self.embedding_model and not self.embedding_error:
+                    self.vector_index_error = "embedding model unavailable"
+                elif not self.guidelines:
+                    self.vector_index_error = "no guidelines loaded"
                 return
-            
+
             logger.info("🔄 Building vector index...")
-            
+
             # Prepare documents
             documents = []
             doc_ids = []
@@ -390,8 +708,9 @@ class LocalHealthRAG:
             
             if not documents:
                 logger.warning("⚠️ No documents to index")
+                self.vector_index_error = "no documents available for indexing"
                 return
-            
+
             # Generate embeddings
             embeddings = self.embedding_model.encode(documents)
             
@@ -405,12 +724,14 @@ class LocalHealthRAG:
             
             # Store document IDs
             self.doc_ids = doc_ids
-            
+
             logger.info(f"✅ Vector index built with {len(documents)} documents")
-            
+            self.vector_index_error = None
+
         except Exception as e:
             logger.error(f"❌ Error building vector index: {e}")
             self.vector_index = None
+            self.vector_index_error = str(e)
     
     def _generate_response(self, prompt: str, max_length: int = 200) -> str:
         """Generate response using TinyLlama model"""
@@ -658,57 +979,100 @@ Response:"""
     
     def _format_natural_response(self, response: Dict[str, Any], query: str) -> str:
         """Format natural language response"""
-        # Use AI response if available
-        if response.get("ai_response") and response["ai_response"] != "Model not available for text generation.":
-            return response["ai_response"]
-        
-        # Fallback to rule-based responses
+        ai_message = response.get("ai_response")
+        if ai_message and ai_message != "Model not available for text generation.":
+            return ai_message
+
+        query_clean = (query or "").strip()
         emergency_type = response.get("emergency_type", "general_health")
-        call_911 = response.get("call_911", False)
-        
-        if emergency_type == "chest_pain":
-            if call_911:
-                return "Based on your symptoms, this appears to be a potential heart attack or cardiac emergency. Chest pain with breathing difficulties is a serious medical emergency that requires immediate attention. You should call 911 right away and try to stay calm while waiting for help."
+        protocol = response.get("protocol") or self.emergency_protocols.get(emergency_type)
+        call_911 = bool(response.get("call_911"))
+
+        if protocol:
+            title = protocol.get("title") or emergency_type.replace("_", " ").title()
+            actions = [a for a in protocol.get("immediate_actions", []) if a][:3]
+            warnings = [w for w in protocol.get("warning_signs", []) if w][:3]
+
+            parts = []
+            if query_clean:
+                parts.append(
+                    f"You mentioned: \"{query_clean}\". This lines up with our {title.lower()} guidance, "
+                    "which treats these symptoms as urgent."
+                )
             else:
-                return "Your chest pain symptoms could indicate several conditions ranging from heartburn to anxiety. However, any chest pain should be taken seriously and evaluated by a healthcare provider. Monitor your symptoms closely and seek medical attention if they worsen."
-        
-        elif emergency_type == "shortness_breath":
-            return "Your symptoms of shortness of breath could indicate several serious conditions including respiratory problems, heart issues, or shock. These symptoms suggest your body may not be getting enough oxygen, which is a medical emergency. You should call 911 immediately and try to stay calm while waiting for help."
-        
-        elif emergency_type == "fainting":
+                parts.append(
+                    f"This matches our {title.lower()} guidance, which treats these symptoms as urgent."
+                )
+
             if call_911:
-                return "Fainting with potential head injury is a serious medical emergency that requires immediate attention. Loss of consciousness can indicate various serious conditions including head trauma, cardiac issues, or neurological problems. Call 911 immediately and while waiting, check if the person is breathing."
-            else:
-                return "Fainting episodes can have various causes including dehydration, low blood pressure, or stress. However, any loss of consciousness should be evaluated by a healthcare provider to rule out serious conditions. Monitor the person closely and seek medical attention if symptoms persist."
-        
-        elif emergency_type == "choking":
-            return "Choking is a life-threatening emergency that requires immediate action. When someone cannot speak or breathe due to a blocked airway, every second counts. Call 911 immediately and perform the Heimlich maneuver if you're trained to do so, or encourage the person to cough forcefully."
-        
-        elif emergency_type == "stroke":
-            return "Facial drooping is a classic sign of stroke, which is a medical emergency that requires immediate treatment. Time is critical with strokes - the sooner treatment begins, the better the outcome. Call 911 immediately and note the time when symptoms started, as this information is crucial for treatment decisions."
-        
+                parts.append(
+                    "Call 911 or your local emergency number immediately and stay with someone who can help."
+                )
+            elif emergency_type != "general_health":
+                parts.append(
+                    "Seek urgent medical evaluation as soon as possible to rule out serious causes."
+                )
+
+            if actions:
+                parts.append("Key immediate steps: " + "; ".join(actions))
+
+            if warnings:
+                parts.append("Watch for: " + "; ".join(warnings) + ".")
+
+            return " ".join(part.strip() for part in parts if part)
+
+        vector_results = response.get("vector_results", []) or []
+        if vector_results:
+            best_result = next((r for r in vector_results if r.get("content")), vector_results[0])
+            content = best_result.get("content", "").strip()
+            if len(content) > 220:
+                content = content[:220].rstrip() + "..."
+            source = best_result.get("title") or best_result.get("source") or "a trusted health reference"
+            base = (
+                f"I found guidance from {source} that matches your message. "
+                f"Key points: {content}"
+            )
+            if call_911:
+                base += " If symptoms escalate or you feel unsafe, call emergency services."
+            return base
+
+        general_notice = (
+            "I'm using fallback guidance because the local language model isn't available. "
+            "Your symptoms should be reviewed by a healthcare professional."
+        )
+        if call_911:
+            general_notice += " If anything worsens or feels life-threatening, call 911 right away."
         else:
-            # General health response
-            vector_results = response.get("vector_results", [])
-            if vector_results:
-                best_result = vector_results[0]
-                content = best_result.get("content", "")
-                if len(content) > 200:
-                    content = content[:200] + "..."
-                return f"Based on your symptoms, here's relevant health information: {content}"
-            else:
-                return "Your symptoms require medical attention and should be evaluated by a healthcare provider. While I cannot provide a specific diagnosis, it's important to take your symptoms seriously. If you're experiencing severe or worsening symptoms, call 911 or seek immediate medical care."
+            general_notice += " Arrange medical evaluation soon and monitor for any new warning signs."
+        return general_notice
     
     def get_system_status(self) -> Dict[str, Any]:
         """Get system status"""
         return {
             "guidelines_loaded": len(self.guidelines),
             "emergency_protocols": len(self.emergency_protocols),
+            "llm_enabled": self.use_tinyllama,
             "llm_model_loaded": self.llm_model is not None,
+            "llm_model_path": self.llm_model_path,
+            "llm_error": self.llm_error,
+            "llm_candidate_errors": self.llm_candidate_errors,
+            "llm_weight_bytes": self.llm_weight_bytes,
+            "llm_placeholder_hint": self.llm_placeholder_hint,
+            "llm_auto_download_attempted": self.llm_auto_download_attempted,
+            "llm_auto_download_succeeded": self.llm_auto_download_succeeded,
+            "llm_auto_download_error": self.llm_auto_download_error,
+            "tinyllama_repo_id": self.tinyllama_repo_id,
+            "tinyllama_min_weight_bytes": self.min_tinyllama_weight_bytes,
+            "tinyllama_auto_download": self.auto_download_tinyllama,
             "embedding_model_loaded": self.embedding_model is not None,
+            "embedding_model_path": self.embedding_model_path,
+            "embedding_error": self.embedding_error,
             "vector_index_built": self.vector_index is not None,
+            "vector_index_error": self.vector_index_error,
+            "faiss_available": self._faiss_available,
             "rag_anything_available": self.rag_anything_client.is_available(),
             "rag_anything_url": self.rag_anything_client.base_url,
+            "rag_anything_error": self.rag_anything_client.last_error,
             "system_ready": True
         }
 
