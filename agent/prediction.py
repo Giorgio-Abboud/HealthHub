@@ -28,11 +28,35 @@ log = logging.getLogger(__name__)
 
 log = logging.getLogger(__name__)
 
+log = logging.getLogger(__name__)
+
 rag_system = LocalHealthRAG()
 status = rag_system.get_system_status()
 
 LLM_STARTUP_ERROR: Optional[str] = None
 LLM_DIAGNOSTICS: Dict[str, Any] = {}
+
+def _preview_small_file(path: Path, size: Optional[int]) -> Dict[str, Optional[str]]:
+    preview: Optional[str] = None
+    hint: Optional[str] = None
+    if size is None or size <= 2048:
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            preview = None
+        else:
+            text = raw[:1024].decode("utf-8", errors="ignore").strip()
+            preview = text[:200]
+            if "git-lfs" in text:
+                hint = (
+                    "File looks like a Git LFS pointer. Install Git LFS and run "
+                    "`git lfs install` then `git lfs pull` to fetch the real model weights."
+                )
+            elif size == 0:
+                hint = "Empty safetensor file detected. Re-download the checkpoint."
+    return {"preview": preview, "placeholder_hint": hint}
+
+
 
 def _summarize_candidate_path(path: Path) -> Dict[str, Any]:
     info: Dict[str, Any] = {"path": str(path), "exists": path.exists()}
@@ -48,6 +72,8 @@ def _summarize_candidate_path(path: Path) -> Dict[str, Any]:
 
         safetensor_details: List[Dict[str, Any]] = []
         total_size = 0
+        placeholder_hint: Optional[str] = None
+
         for st_path in safetensor_paths:
             try:
                 size = st_path.stat().st_size
@@ -55,19 +81,30 @@ def _summarize_candidate_path(path: Path) -> Dict[str, Any]:
                 size = None
             else:
                 total_size += size or 0
-            safetensor_details.append({
+
+            detail = {
                 "name": st_path.name,
                 "size_bytes": size,
-            })
+            }
+            preview_info = _preview_small_file(st_path, size)
+            if preview_info["preview"]:
+                detail["preview"] = preview_info["preview"]
+            if preview_info["placeholder_hint"]:
+                detail["placeholder_hint"] = preview_info["placeholder_hint"]
+                if not placeholder_hint:
+                    placeholder_hint = preview_info["placeholder_hint"]
+            safetensor_details.append(detail)
+
 
         info.update({
             "config_present": config_path.exists(),
             "config_size_bytes": config_path.stat().st_size if config_path.exists() else None,
             "tokenizer_present": tokenizer_path.exists(),
             "tokenizer_size_bytes": tokenizer_path.stat().st_size if tokenizer_path.exists() else None,
-
             "safetensor_files": safetensor_details,
             "safetensor_total_bytes": total_size,
+            "placeholder_hint": placeholder_hint,
+
         })
 
         if config_path.exists():
@@ -84,36 +121,55 @@ def _summarize_candidate_path(path: Path) -> Dict[str, Any]:
 if not status.get("system_ready", False):
     raise RuntimeError("LocalHealthRAG system is not ready. Check your setup.")
 
+llm_enabled = bool(status.get("llm_enabled", True))
+
+
 if not status.get("llm_model_loaded", False):
     llm_error = status.get("llm_error")
     candidate_fn = getattr(rag_system, "_discover_llm_candidates", None)
     candidate_details: List[Dict[str, Any]] = []
-    if callable(candidate_fn):
+    if llm_enabled and callable(candidate_fn):
+
         for candidate_path in candidate_fn():
             candidate_details.append(_summarize_candidate_path(Path(candidate_path)))
 
     models_dir = getattr(rag_system, "models_dir", None)
-    if models_dir is not None:
+    if models_dir is not None and llm_enabled:
+
         models_dir_path = Path(models_dir)
         if not any(detail.get("path") == str(models_dir_path) for detail in candidate_details):
             candidate_details.append(_summarize_candidate_path(models_dir_path))
+
+    placeholder_hint = next(
+        (detail.get("placeholder_hint") for detail in candidate_details if detail.get("placeholder_hint")),
+        None,
+    )
+
 
     LLM_DIAGNOSTICS = {
         "llm_error": llm_error or "TinyLlama model was not loaded.",
         "llm_model_path": status.get("llm_model_path"),
         "models_dir": str(models_dir) if models_dir is not None else None,
         "candidate_paths": candidate_details,
-
         "llm_candidate_errors": status.get("llm_candidate_errors", []),
         "llm_weight_bytes": status.get("llm_weight_bytes"),
-
+        "llm_placeholder_hint": placeholder_hint,
+        "llm_enabled": llm_enabled,
     }
 
-    LLM_STARTUP_ERROR = (
-        "TinyLlama model failed to initialize; see diagnostics for details. "
-        "Verify that the TinyLlama directory contains a valid Hugging Face checkpoint "
-        "(config.json, tokenizer files, and *.safetensors weights)."
-    )
+    if not llm_enabled:
+        LLM_STARTUP_ERROR = (
+            "TinyLlama loading is disabled (set USE_TINYLLAMA=1 to enable it after running "
+            "`python scripts/ensure_models.py`)."
+        )
+    else:
+        LLM_STARTUP_ERROR = (
+            "TinyLlama model failed to initialize; see diagnostics for details. "
+            "Run `python scripts/ensure_models.py` to download the checkpoint if it is missing, "
+            "then set USE_TINYLLAMA=1."
+        )
+        if placeholder_hint:
+            LLM_STARTUP_ERROR = f"{LLM_STARTUP_ERROR} {placeholder_hint}"
 
     log.error("TinyLlama failed to load: %s", json.dumps(LLM_DIAGNOSTICS, indent=2))
 

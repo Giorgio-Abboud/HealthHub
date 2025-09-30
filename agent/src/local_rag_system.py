@@ -136,15 +136,16 @@ class LocalHealthRAG:
             Path("agent") / "mobile_rag_ready",
         ])
         self.embedding_model_name = embedding_model_name
+        self.use_tinyllama = self._should_enable_tinyllama()
         
         # Initialize components
         self.llm_model = None
         self.llm_tokenizer = None
         self.llm_model_path: Optional[str] = None
         self.llm_error: Optional[str] = None
-
         self.llm_candidate_errors: List[str] = []
         self.llm_weight_bytes: Optional[int] = None
+        self.llm_placeholder_hint: Optional[str] = None
 
 
         self.embedding_model = None
@@ -373,25 +374,68 @@ class LocalHealthRAG:
 
         details = []
         total_size = 0
+        placeholder_hint: Optional[str] = None
+
         for st_path in safetensor_files:
             try:
                 size = st_path.stat().st_size
             except OSError:
                 size = 0
             total_size += size
+
+            preview: Optional[str] = None
+            file_hint: Optional[str] = None
+            if size <= 2048:
+                try:
+                    raw = st_path.read_bytes()
+                except OSError:
+                    preview = None
+                else:
+                    text_preview = raw[:1024].decode("utf-8", errors="ignore").strip()
+                    preview = text_preview[:200]
+                    if "git-lfs" in text_preview:
+                        file_hint = (
+                            "File appears to be a Git LFS pointer. Install Git LFS and run "
+                            "`git lfs install` followed by `git lfs pull` to download the real weights."
+                        )
+                    elif size == 0:
+                        file_hint = "Empty safetensor file found. Re-download the checkpoint."
+
+            if file_hint and not placeholder_hint:
+                placeholder_hint = file_hint
+
             details.append({
                 "path": str(st_path),
                 "size_bytes": size,
+                "preview": preview,
+                "placeholder_hint": file_hint,
+
             })
 
         return {
             "files": details,
             "total_size_bytes": total_size,
+            "placeholder_hint": placeholder_hint,
         }
+
+    def _should_enable_tinyllama(self) -> bool:
+        """Check configuration to decide if TinyLlama should be loaded."""
+        raw = os.getenv("USE_TINYLLAMA", "0").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
 
 
     def _load_tinyllama_model(self):
         """Load TinyLlama model for local inference (macOS compatible)"""
+        if not self.use_tinyllama:
+            self.llm_error = "TinyLlama loading disabled (set USE_TINYLLAMA=1 to enable)."
+            self.llm_candidate_errors = []
+            self.llm_weight_bytes = None
+            self.llm_placeholder_hint = None
+            logger.info(
+                "⏭️  Skipping TinyLlama load because USE_TINYLLAMA is not enabled."
+            )
+            return
+
         try:
             # Find model path
             model_path = None
@@ -401,6 +445,7 @@ class LocalHealthRAG:
             self.llm_model_path = None
             self.llm_candidate_errors = []
             self.llm_weight_bytes = None
+            self.llm_placeholder_hint = None
 
 
             for candidate in self._discover_llm_candidates():
@@ -409,10 +454,15 @@ class LocalHealthRAG:
                     st_stats = self._collect_safetensor_stats(candidate)
                     total_bytes = st_stats.get("total_size_bytes", 0)
                     if total_bytes and total_bytes < 50 * 1024 * 1024:  # 50 MB threshold
+                        hint = st_stats.get("placeholder_hint")
+
                         truncated_msg = (
                             f"weights appear truncated ({total_bytes} bytes). "
                             "Download the full TinyLlama checkpoint (~2 GB)."
                         )
+                        if hint:
+                            truncated_msg = f"{truncated_msg} {hint}"
+                            self.llm_placeholder_hint = hint
                         logger.warning(
                             "⚠️ TinyLlama candidate rejected due to insufficient weight size: %s (%s)",
                             candidate,
@@ -441,6 +491,7 @@ class LocalHealthRAG:
                     self.llm_model = model
                     self.llm_model_path = str(candidate)
                     self.llm_weight_bytes = total_bytes or None
+                    self.llm_placeholder_hint = None
 
                     break
                 except Exception as candidate_error:  # pragma: no cover - logging only
@@ -850,11 +901,14 @@ Response:"""
         return {
             "guidelines_loaded": len(self.guidelines),
             "emergency_protocols": len(self.emergency_protocols),
+            "llm_enabled": self.use_tinyllama,
             "llm_model_loaded": self.llm_model is not None,
             "llm_model_path": self.llm_model_path,
             "llm_error": self.llm_error,
             "llm_candidate_errors": self.llm_candidate_errors,
             "llm_weight_bytes": self.llm_weight_bytes,
+            "llm_placeholder_hint": self.llm_placeholder_hint,
+
             "embedding_model_loaded": self.embedding_model is not None,
             "embedding_model_path": self.embedding_model_path,
             "embedding_error": self.embedding_error,
